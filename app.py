@@ -54,6 +54,8 @@ def practice_tests():
 
                 # Call the wrapper function that returns generated text
                 test_text = generate_practice_test_return_text(pdf_path)
+                if not test_text:
+                    test_text = "(No content generated or error occurred.)"
                 results.append((file.filename, test_text))
 
         # Return results HTML even if results is empty
