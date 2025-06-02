@@ -49,15 +49,20 @@ def practice_tests():
                     continue  # skip non-PDFs
 
                 pdf_path = os.path.join(tmpdir, file.filename)
+                os.makedirs(os.path.dirname(pdf_path), exist_ok=True)  # Ensure directory exists
                 file.save(pdf_path)
 
                 # Call the wrapper function that returns generated text
                 test_text = generate_practice_test_return_text(pdf_path)
                 results.append((file.filename, test_text))
 
+        # Return results HTML even if results is empty
         html = "<h1>Generated Practice Tests</h1>"
-        for fname, content in results:
-            html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
+        if not results:
+            html += "<p>No valid PDF files were uploaded or processed.</p>"
+        else:
+            for fname, content in results:
+                html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
         return html
 
 
