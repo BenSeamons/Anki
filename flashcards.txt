@@ -1,0 +1,32 @@
+Which hepatitis viruses are transmitted fecal-orally?	Hepatitis A and E ("vowels from the bowels")
+Which hepatitis virus is associated with high mortality in pregnant women?	Hepatitis E
+Which hepatitis virus is a DNA virus?	Hepatitis B (partially double-stranded DNA, hepadnavirus)
+Which hepatitis viruses can become chronic?	Hepatitis B, C, D (if with B)
+Which hepatitis virus is most likely to become chronic?	Hepatitis C (majority progress to chronic infection)
+Which hepatitis viruses have a vaccine?	Hepatitis A and B (and by preventing B, you prevent D too)
+What is the key viral antigen required for Hepatitis D infection?	Hepatitis B surface antigen (HBsAg)
+What is the classic route of transmission for hepatitis B and C?	Blood, sexual, and perinatal (vertical)
+What is the best marker for acute Hepatitis A infection?	Anti-HAV IgM antibody
+What is the best marker for current Hepatitis B infection?	HBsAg (Hepatitis B surface antigen)
+What serologic marker indicates Hepatitis B immunity (from vaccine or past infection)?	Anti-HBs (antibody to surface antigen)
+What marker is present in someone recently infected with HBV but not after vaccination?	Anti-HBc (antibody to core antigen)
+Which Hepatitis B marker indicates high infectivity and active replication?	HBeAg (envelope antigen)
+Which serologic marker differentiates acute from chronic HBV infection?	Anti-HBc IgM (acute); Anti-HBc IgG (chronic or resolved)
+What marker confirms active Hepatitis C infection?	HCV RNA (by PCR)
+Which hepatitis virus has no vaccine and frequently causes chronic infection?	Hepatitis C
+Which hepatitis virus requires co-infection or superinfection with Hepatitis B?	Hepatitis D (delta agent)
+What is the best way to prevent Hepatitis D infection?	Hepatitis B vaccination (no HBV = no HDV)
+What is the likely outcome of Hepatitis A and E infection?	Acute, self-limited (no chronic/carrier state)
+What extrahepatic complications are associated with chronic Hepatitis B?	Membranous nephropathy, polyarteritis nodosa, aplastic anemia
+What extrahepatic complication is associated with chronic Hepatitis C?	Cryoglobulinemia, membranoproliferative glomerulonephritis, lichen planus
+What is the most serious complication of chronic HBV or HCV infection?	Hepatocellular carcinoma (HCC) and cirrhosis
+What is the “window period” in Hepatitis B infection?	Time when HBsAg and anti-HBs are both negative; only anti-HBc is positive
+Which hepatitis virus is associated with outbreaks from contaminated water in developing countries?	Hepatitis E (and A)
+Which hepatitis virus is inactivated by the killed vaccine?	Hepatitis A
+Which hepatitis B serologic marker is positive in vaccinated (never infected) individuals?	Anti-HBs only
+Which hepatitis B serologic markers are positive in someone with resolved infection?	Anti-HBs and anti-HBc IgG (no HBsAg)
+What class of drugs are used to treat chronic Hepatitis B and C?	Nucleos(t)ide analogs (HBV: tenofovir, entecavir; HCV: direct-acting antivirals)
+Why is there no vaccine for hepatitis C?	Antigenic variation in HCV envelope proteins prevents effective vaccine development
+Which hepatitis viruses are naked (non-enveloped)?	Hepatitis A and E (survive stomach acid and GI tract)
+
+
