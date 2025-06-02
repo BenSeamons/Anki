@@ -104,6 +104,8 @@ def index():
             <body>
                 <h1>Paste Your Cards Here (tab-separated Front and Back)</h1>
                 <form method="POST">
+                    <label for="deck_name">Deck Name:</label>
+                    <input type="text" id="deck_name" name="deck_name" placeholder="Enter deck name" required><br><br>
                     <textarea name="cards_text" rows="15" cols="80" placeholder="Front [tab] Back"></textarea><br>
                     <button type="submit">Generate Anki Deck</button>
                 </form>
