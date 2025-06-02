@@ -2,6 +2,7 @@ from flask import Flask, request, render_template_string, send_file
 import io
 import genanki
 import os
+import hashlib
 
 app = Flask(__name__)
 
@@ -30,11 +31,17 @@ def parse_cards(text):
 def index():
     if request.method == 'POST':
         cards_text = request.form.get('cards_text', '')
+        deck_name = request.form.get('deck_name', 'Custom Deck').strip()
+        if not deck_name:
+            deck_name = 'Custom Deck'
         cards = parse_cards(cards_text)
 
+        # Generate deck_id from deck_name (using hashlib)
+        deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
+
         deck = genanki.Deck(
-            2059400110,  # unique deck ID (change if needed)
-            'Custom Deck'
+            deck_id,  # unique deck ID (change if needed)
+            deck_name
         )
 
         # Basic model
