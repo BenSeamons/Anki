@@ -110,6 +110,17 @@ def index():
             <head><title>Anki Deck Generator</title></head>
             <body>
                 <h1>Paste Your Cards Here (tab-separated Front and Back)</h1>
+
+                <!-- Put your prompt example instructions here -->
+                <h2>How to generate good cards for this app</h2>
+                <p>To get the best cards, you can ask your AI or note-taking tool using a prompt like this:</p>
+                <pre style="background:#f0f0f0; padding:10px; border-radius:5px; font-family: monospace;">
+                Please generate Anki cards for me from this (pdf/powerpoint) in both the Basic and Cloze format.  
+                Please give them to me as plain text with the Basic cards front and back separated by a tab.  
+                Focus on giving me high yield flashcards that would help a first year med student pass their board exams.
+                </pre>
+
+    
                 <form method="POST">
                     <label for="deck_name">Deck Name:</label>
                     <input type="text" id="deck_name" name="deck_name" placeholder="Enter deck name" required><br><br>
