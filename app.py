@@ -3,8 +3,12 @@ import io
 import genanki
 import os
 import hashlib
+import tempfile
+from just_PDFs import generate_practice_test_return_text
 
 app = Flask(__name__)
+
+
 
 # Simple parser to convert pasted text into cards list
 def parse_cards(text):
@@ -27,7 +31,54 @@ def parse_cards(text):
             })
     return cards
 
-@app.route('/', methods=['GET', 'POST'])
+
+@app.route('/practice-tests', methods=['GET', 'POST'])
+def practice_tests():
+    if request.method == 'POST':
+        if 'pdfs' not in request.files:
+            return "No files uploaded", 400
+
+        files = request.files.getlist('pdfs')
+        if not files or files[0].filename == '':
+            return "No PDFs selected", 400
+
+        results = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for file in files:
+                if not file.filename.lower().endswith('.pdf'):
+                    continue  # skip non-PDFs
+
+                pdf_path = os.path.join(tmpdir, file.filename)
+                file.save(pdf_path)
+
+                # Call the wrapper function that returns generated text
+                test_text = generate_practice_test_return_text(pdf_path)
+                results.append((file.filename, test_text))
+
+        html = "<h1>Generated Practice Tests</h1>"
+        for fname, content in results:
+            html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
+        return html
+
+
+@app.route('/')
+def home():
+    return render_template_string('''
+    <html>
+      <head>
+        <title>Study Tools Hub</title>
+      </head>
+      <body>
+        <h1>Welcome to Your Study Tools Hub</h1>
+        <p>Select a tool below:</p>
+        <ul>
+          <li><a href="/anki-generator">Anki Deck Generator (Paste Cards)</a></li>
+          <li><a href="/practice-tests">Practice Test Generator (Upload PDFs)</a></li>
+        </ul>
+      </body>
+    </html>
+    ''')
+@app.route('/anki-generator', methods=['GET', 'POST'])
 def index():
     if request.method == 'POST':
         cards_text = request.form.get('cards_text', '')
@@ -106,33 +157,88 @@ def index():
 
     # GET request returns HTML form
     return render_template_string('''
-        <html>
-            <head><title>Anki Deck Generator</title></head>
-            <body>
-                <h1>Paste Your Cards Here (tab-separated Front and Back)</h1>
+    <html>
+    <head>
+      <title>Study Tools Combined</title>
+      <style>
+        body {
+          font-family: Arial, sans-serif;
+          margin: 20px;
+        }
+        .container {
+          display: flex;
+          gap: 40px;
+        }
+        .half {
+          flex: 1;
+          border: 1px solid #ccc;
+          padding: 20px;
+          box-sizing: border-box;
+          height: 90vh;
+          overflow-y: auto;
+        }
+        textarea {
+          width: 100%;
+          box-sizing: border-box;
+        }
+        input[type="text"] {
+          width: 100%;
+          box-sizing: border-box;
+          padding: 6px;
+          margin-bottom: 10px;
+        }
+        button {
+          padding: 10px 15px;
+          font-size: 1em;
+          cursor: pointer;
+        }
+        pre {
+          background: #f0f0f0;
+          padding: 10px;
+          border-radius: 5px;
+          font-family: monospace;
+          white-space: pre-wrap;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>Study Tools Hub</h1>
+      <div class="container">
+        <!-- Anki Deck Generator -->
+        <div class="half">
+          <h2>Anki Deck Generator</h2>
+          <h3>How to generate good cards for this app</h3>
+          <p>To get the best cards, you can ask your AI or note-taking tool using a prompt like this:</p>
+          <pre>
+    Please generate Anki cards for me from this (pdf/powerpoint) in both the Basic and Cloze format.
+    Please give them to me as plain text with the Basic cards front and back separated by a tab.
+    Focus on giving me high yield flashcards that would help a first year med student pass their board exams.
+          </pre>
+          <form method="POST" action="/anki-generator">
+            <label for="deck_name">Deck Name:</label>
+            <input type="text" id="deck_name" name="deck_name" placeholder="Enter deck name" required>
+            <textarea name="cards_text" rows="15" placeholder="Front [tab] Back"></textarea><br>
+            <button type="submit">Generate Anki Deck</button>
+          </form>
+          <p>Use <code>{&#123;&#123;c1::cloze deletion&#125;&#125;}</code> syntax for cloze cards in the Front field. Back can be empty for cloze cards.</p>
+        </div>
 
-                <!-- Put your prompt example instructions here -->
-                <h2>How to generate good cards for this app</h2>
-                <p>To get the best cards, you can ask your AI or note-taking tool using a prompt like this:</p>
-                <pre style="background:#f0f0f0; padding:10px; border-radius:5px; font-family: monospace;">
-                Please generate Anki cards for me from this (pdf/powerpoint) in both the Basic and Cloze format.  
-                Please give them to me as plain text with the Basic cards front and back separated by a tab.  
-                Focus on giving me high yield flashcards that would help a first year med student pass their board exams.
-                </pre>
-
-    
-                <form method="POST">
-                    <label for="deck_name">Deck Name:</label>
-                    <input type="text" id="deck_name" name="deck_name" placeholder="Enter deck name" required><br><br>
-                    <textarea name="cards_text" rows="15" cols="80" placeholder="Front [tab] Back"></textarea><br>
-                    <button type="submit">Generate Anki Deck</button>
-                </form>
-                <p>Use <code>{&#123;&#123;c1::cloze deletion&#125;&#125;}</code> syntax for cloze cards in the Front field. Back field can be empty for cloze.</p>
-            </body>
-        </html>
+        <!-- Practice Test Generator -->
+        <div class="half">
+          <h2>Practice Test Generator</h2>
+          <form method="POST" action="/practice-tests" enctype="multipart/form-data">
+            <label for="pdfs">Upload PDFs or Folder of PDFs (Chrome, Edge, Opera support folder upload):</label><br>
+            <input type="file" id="pdfs" name="pdfs" multiple webkitdirectory accept="application/pdf"><br><br>
+            <button type="submit">Generate Practice Tests</button>
+          </form>
+          <p><small>Note: Folder upload works only in Chrome, Edge, and Opera. Firefox does not support folder upload.</small></p>
+        </div>
+      </div>
+    </body>
+    </html>
     ''')
+
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
-
