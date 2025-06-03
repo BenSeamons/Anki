@@ -235,6 +235,7 @@ def index():
           <h2>Practice Test Generator</h2>
           <form method="POST" action="/practice-tests" enctype="multipart/form-data">
             <label for="pdfs">Upload PDFs or Folder of PDFs (Chrome, Edge, Opera support folder upload):</label><br>
+            <p><strong>Note:</strong> Processing your PDFs can take up to <em>10 minutes</em>. Please be patient after submitting the form.</p>
             <input type="file" id="pdfs" name="pdfs" multiple webkitdirectory accept="application/pdf"><br><br>
             <button type="submit">Generate Practice Tests</button>
           </form>
