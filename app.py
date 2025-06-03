@@ -35,11 +35,18 @@ def parse_cards(text):
 @app.route('/practice-tests', methods=['GET', 'POST'])
 def practice_tests():
     if request.method == 'POST':
-        if 'pdfs' not in request.files:
-            return "No files uploaded", 400
+       # Get files from both inputs
+        folder_files = request.files.getlist('folder_pdfs')
+        individual_files = request.files.getlist('individual_pdfs')
 
-        files = request.files.getlist('pdfs')
-        if not files or files[0].filename == '':
+        all_files = []
+
+        if folder_files:
+            all_files.extend(folder_files)
+        if individual_files:
+            all_files.extend(individual_files)
+
+        if not all_files or all_files[0].filename == '':
             return "No PDFs selected", 400
 
         results = []
