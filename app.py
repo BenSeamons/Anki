@@ -51,7 +51,7 @@ def practice_tests():
 
         results = []
         with tempfile.TemporaryDirectory() as tmpdir:
-            for file in files:
+            for file in all_files:
                 if not file.filename.lower().endswith('.pdf'):
                     continue  # skip non-PDFs
 
