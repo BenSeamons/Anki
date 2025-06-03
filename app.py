@@ -234,9 +234,12 @@ def index():
         <div class="half">
           <h2>Practice Test Generator</h2>
           <form method="POST" action="/practice-tests" enctype="multipart/form-data">
-            <label for="pdfs">Upload PDFs or Folder of PDFs (Chrome, Edge, Opera support folder upload):</label><br>
+            <label for="pdfs">Upload a Folder of PDFs (Chrome, Edge, Opera support folder upload):</label><br>
             <p><strong>Note:</strong> Processing your PDFs can take up to <em>10 minutes</em>. Please be patient after submitting the form.</p>
             <input type="file" id="pdfs" name="pdfs" multiple webkitdirectory accept="application/pdf"><br><br>
+            <label for="individual_pdfs">Or upload Individual PDF files:</label><br>
+            <input type="file" id="individual_pdfs" name="individual_pdfs" multiple accept="application/pdf"><br><br>
+
             <button type="submit">Generate Practice Tests</button>
           </form>
           <p><small>Note: Folder upload works only in Chrome, Edge, and Opera. Firefox does not support folder upload.</small></p>
