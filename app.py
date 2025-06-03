@@ -87,7 +87,6 @@ def home():
         <p>Select a tool below:</p>
         <ul>
           <li><a href="/anki-generator">Anki Deck Generator (Paste Cards)</a></li>
-          <li><a href="/practice-tests">Practice Test Generator (Upload PDFs)</a></li>
         </ul>
       </body>
     </html>
