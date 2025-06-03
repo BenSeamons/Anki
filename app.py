@@ -227,6 +227,9 @@ def index():
     Please give them to me as plain text with the Basic cards front and back separated by a tab.
     Focus on giving me high yield flashcards that would help a first year med student pass their board exams.
           </pre>
+          <hr>
+          <p>Or, if you want to generate cards automatically, you can try <a href="https://chatgpt.com/g/g-683f7d2e85348191b074c1875dc79ca7-anki-card-generator" target="_blank" rel="noopener noreferrer">this GPT-powered Anki card generator</a> — <em>use at your own risk!</em></p>
+          <hr>
           <form method="POST" action="/anki-generator">
             <label for="deck_name">Deck Name:</label>
             <input type="text" id="deck_name" name="deck_name" placeholder="Enter deck name" required>
