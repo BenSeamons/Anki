@@ -23,12 +23,13 @@ def read_csv_cards(file_path):
             # Detect if this is a cloze card by checking for cloze syntax
             is_cloze = '{{c' in front
 
-            if front and back:
+            if front:
                 cards.append({
                     'front': front,
                     'back': back,
                     'deck': deck,
-                    'tags': tags
+                    'tags': tags,
+                    'is_cloze': is_cloze
                 })
     return cards
 
