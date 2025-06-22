@@ -53,10 +53,19 @@ def test_cloze_detection():
     assert card['is_cloze'] is True
 
 
-def test_ignore_lines_without_tab():
+def test_ignore_non_cloze_without_tab():
     text = "Front\tBack\nInvalid line without tab\nAnother front\tAnother back"
     result = parse_cards(text)
     assert len(result) == 2
     fronts = [c['front'] for c in result]
     assert 'Front' in fronts
     assert 'Another front' in fronts
+
+
+def test_cloze_without_tab():
+    text = "Front\tBack\n{{c1::Capital of France}} is Paris\nAnother front\tAnother back"
+    result = parse_cards(text)
+    assert len(result) == 3
+    cloze_card = [c for c in result if c['is_cloze']][0]
+    assert cloze_card['front'] == "{{c1::Capital of France}} is Paris"
+    assert cloze_card['back'] == ''

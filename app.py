@@ -15,20 +15,29 @@ def parse_cards(text):
     cards = []
     lines = text.strip().split('\n')
     for line in lines:
-        # Expect tab-separated front and back
+        # Allow cloze lines without a tab; otherwise require front/back
         if '\t' in line:
             front, back = line.split('\t', 1)
-            front = front.strip()
-            back = back.strip()
+        elif '{{c' in line:
+            front, back = line, ''
+        else:
+            continue
 
-            # Detect cloze by {{c1::...}} style in front
-            is_cloze = '{{c' in front
+        front = front.strip()
+        back = back.strip()
 
-            cards.append({
-                'front': front,
-                'back': back,
-                'is_cloze': is_cloze
-            })
+        # Skip completely empty lines
+        if not front:
+            continue
+
+        # Detect cloze by {{c1::...}} style in front
+        is_cloze = '{{c' in front
+
+        cards.append({
+            'front': front,
+            'back': back,
+            'is_cloze': is_cloze
+        })
     return cards
 
 
