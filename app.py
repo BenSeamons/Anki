@@ -4,6 +4,8 @@ import genanki
 import os
 import hashlib
 import tempfile
+import pandas as pd
+from PyPDF2 import PdfReader
 from just_PDFs import generate_practice_test_return_text
 
 app = Flask(__name__)
@@ -82,6 +84,37 @@ def practice_tests():
             for fname, content in results:
                 html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
         return html
+
+@app.route('/decksurf', methods=['POST'])
+def decksurf():
+    # Accept either file upload or pasted text
+    los = []
+    if 'file' in request.files and request.files['file'].filename:
+        f = request.files['file']
+        filename = f.filename.lower()
+        if filename.endswith('.pdf'):
+            reader = PdfReader(f)
+            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+            # crude LO split
+            los = [line.strip() for line in text.split("\n") if 20 < len(line.strip()) < 250]
+        elif filename.endswith('.csv'):
+            df = pd.read_csv(f)
+            col = df.columns[0]
+            los = df[col].dropna().astype(str).tolist()
+        elif filename.endswith('.txt'):
+            los = [line.strip() for line in f.read().decode('utf-8').splitlines() if line.strip()]
+    elif request.form.get('text'):
+        los = [line.strip() for line in request.form['text'].splitlines() if line.strip()]
+
+    if not los:
+        return "No learning objectives found.", 400
+
+    # For now, just echo them back (you can plug in Deck_Sorter here later)
+    html = "<h2>Extracted Learning Objectives</h2><ul>"
+    for lo in los[:30]:  # cap for readability
+        html += f"<li>{lo}</li>"
+    html += "</ul>"
+    return html
 
 
 @app.route('/')
@@ -192,12 +225,13 @@ def index():
           gap: 40px;
         }
         .half {
-          flex: 1;
-          border: 1px solid #ccc;
-          padding: 20px;
-          box-sizing: border-box;
-          height: 90vh;
-          overflow-y: auto;
+              flex: 1;
+              min-width: 300px;
+              border: 1px solid #ccc;
+              padding: 20px;
+              box-sizing: border-box;
+              height: 90vh;
+              overflow-y: auto;
         }
         textarea {
           width: 100%;
@@ -265,6 +299,17 @@ def index():
       </div>
     </body>
     </html>
+        <!-- DeckSurfer Mapper -->
+        <div class="half">
+          <h2>DeckSurfer Mapper</h2>
+          <form method="POST" action="/decksurf" enctype="multipart/form-data">
+            <label for="decksurf_file">Upload PDF/CSV/TXT:</label><br>
+            <input type="file" id="decksurf_file" name="file" accept=".pdf,.csv,.txt"><br><br>
+            <label for="decksurf_text">Or paste objectives:</label><br>
+            <textarea id="decksurf_text" name="text" rows="10" placeholder="One objective per line"></textarea><br><br>
+            <button type="submit">Run DeckSurf</button>
+          </form>
+        </div>
     ''')
 
 
