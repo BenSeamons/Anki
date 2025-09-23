@@ -131,40 +131,37 @@ def load_apkg_to_df(apkg_file):
 @app.route("/decksurf", methods=["POST"])
 def decksurf():
     try:
-        # --- 1. Validate deck upload ---
+        # 1. Load deck file
         if "deck_file" not in request.files or request.files["deck_file"].filename == "":
             return jsonify({"error": "No deck file uploaded"}), 400
 
         deck_file = request.files["deck_file"]
 
-        # --- 2. Load deck ---
         if deck_file.filename.endswith(".apkg"):
             deck_df = load_apkg_to_df(deck_file)
         elif deck_file.filename.endswith(".txt"):
             deck_df = pd.read_csv(deck_file, sep="\t", engine="python", on_bad_lines="skip")
-        else:
+        else:  # assume CSV
             deck_df = pd.read_csv(deck_file, engine="python", on_bad_lines="skip")
 
         if "noteId" not in deck_df.columns:
             deck_df["noteId"] = range(len(deck_df))
 
         required_cols = {"noteId", "Front", "Back"}
-        if not required_cols.issubset(set(deck_df.columns)):
-            return jsonify({"error": "Deck file must have noteId, Front, Back columns"}), 400
+        if not required_cols.issubset(deck_df.columns):
+            return jsonify({"error": "Deck must have noteId, Front, Back"}), 400
 
-        # --- 3. Convert to card dicts ---
         deck_cards = []
         for _, row in deck_df.iterrows():
-            card_text = f"{row.get('Front','')} {row.get('Back','')}"
+            text = f"{row.get('Front','')} {row.get('Back','')}"
             deck_cards.append({
-                "note_id": int(row.get("noteId")),
-                "front": str(row.get("Front","")),
-                "back": str(row.get("Back","")),
-                "tags": row.get("Tags",""),
-                "text": card_text
+                "note_id": int(row["noteId"]),
+                "front": str(row["Front"]),
+                "back": str(row["Back"]),
+                "text": text
             })
 
-        # --- 4. Parse learning objectives ---
+        # 2. Parse objectives
         los = []
         if "los_file" in request.files and request.files["los_file"].filename:
             f = request.files["los_file"]
@@ -185,14 +182,14 @@ def decksurf():
         if not los:
             return jsonify({"error": "No learning objectives found"}), 400
 
-        # --- 5. Embed cards ---
+        # 3. Embeddings
         card_texts = [c["text"] for c in deck_cards]
         card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
+        alpha = float(request.form.get("alpha", 0.85))
 
         results = []
-        alpha = float(request.form.get("alpha", 0.85))  # default weight for embeddings
+        matched_ids = set()
 
-        # --- 6. Match each LO ---
         for lo in los:
             lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
             emb_scores = card_embeddings @ lo_vec
@@ -215,12 +212,54 @@ def decksurf():
                     "score": float(combo_scores[i])
                 })
                 note_ids.append(c["note_id"])
+                matched_ids.add(c["note_id"])
 
             results.append({
                 "learning_objective": lo,
                 "matches": matches,
                 "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
             })
+
+        # 4. Build unsuspended deck
+        deck_name = request.form.get("deck_name", "Uploaded Deck")
+        deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
+        gen_deck = genanki.Deck(deck_id, deck_name)
+        basic_model = genanki.Model(
+            1607392319, "Basic Model",
+            fields=[{'name': 'Front'}, {'name': 'Back'}],
+            templates=[{'name': 'Card 1', 'qfmt': '{{Front}}', 'afmt': '{{Front}}<br>{{Back}}'}]
+        )
+
+        for c in deck_cards:
+            note = genanki.Note(
+                model=basic_model,
+                fields=[c["front"], c["back"]],
+                tags=["unsuspended"] if c["note_id"] in matched_ids else ["suspended"]
+            )
+            gen_deck.add_note(note)
+
+        package = genanki.Package(gen_deck)
+        deck_data = io.BytesIO()
+        package.write_to_file(deck_data)
+        deck_data.seek(0)
+
+        mode = request.form.get("mode", "json")
+        if mode == "apkg":
+            return send_file(
+                deck_data,
+                as_attachment=True,
+                download_name=f"{deck_name}_unsuspended.apkg",
+                mimetype="application/octet-stream"
+            )
+        else:
+            return jsonify({"stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
+                            "results": results})
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
         # --- 7. Build new deck with unsuspended matches ---
         deck_name = request.form.get("deck_name", "Uploaded Deck")
@@ -451,22 +490,23 @@ def index():
         <div class="half">
           <h2>DeckSurfer Mapper</h2>
           <form id="decksurf-form" enctype="multipart/form-data">
-            <label>Upload Deck CSV:</label><br>
-            <input type="file" id="deck_file" name="deck_file" accept=".apkg,.csv,.txt" required>
+            <label>Upload Deck (.apkg, .csv, .txt):</label><br>
+            <input type="file" id="deck_file" name="deck_file" accept=".apkg,.csv,.txt" required><br><br>
         
             <label>Upload Lecture Objectives (PDF/CSV/TXT):</label><br>
             <input type="file" id="los_file" name="los_file" accept=".pdf,.csv,.txt"><br><br>
         
             <label>Or paste objectives:</label><br>
             <textarea id="los_text" name="text" rows="8" placeholder="One objective per line"></textarea><br><br>
-
+        
             <label for="alpha">Semantic Weight (α):</label><br>
             <input type="range" id="alpha" name="alpha" min="0" max="1" step="0.05" value="0.85"
                    oninput="alphaValue.value = this.value">
             <output id="alphaValue">0.85</output><br><br>
-
         
-            <button type="submit">Run DeckSurf</button>
+            <!-- Two buttons -->
+            <button type="button" id="run-decksurf">See Matches</button>
+            <button type="button" id="download-deck">Download Deck</button>
           </form>
         
           <div id="decksurf-results" style="margin-top:20px;"></div>
@@ -474,22 +514,42 @@ def index():
         </div>
         
         <script>
-        document.getElementById("decksurf-form").addEventListener("submit", async (e) => {
-          e.preventDefault();
-        
+        async function runDeckSurf(mode="json") {
           const formData = new FormData();
           const deckFile = document.getElementById("deck_file").files[0];
           const losFile = document.getElementById("los_file").files[0];
           const losText = document.getElementById("los_text").value.trim();
+          const alpha = document.getElementById("alpha").value;
         
           if (!deckFile) {
-            alert("Please upload a deck CSV file");
+            alert("Please upload a deck file");
             return;
           }
           formData.append("deck_file", deckFile);
           if (losFile) formData.append("los_file", losFile);
           if (losText) formData.append("text", losText);
+          formData.append("alpha", alpha);
+          formData.append("mode", mode);
         
+          if (mode === "apkg") {
+            // Expect a file download
+            const response = await fetch("/decksurf", { method: "POST", body: formData });
+            if (!response.ok) {
+              alert("Error generating deck");
+              return;
+            }
+            const blob = await response.blob();
+            const url = window.URL.createObjectURL(blob);
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = "unsuspended_deck.apkg";
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            return;
+          }
+        
+          // Otherwise, expect JSON results
           const resultsBox = document.getElementById("decksurf-results");
           resultsBox.innerHTML = "<p>Processing... ⏳</p>";
         
@@ -525,7 +585,6 @@ def index():
         
           resultsBox.innerHTML = html;
         
-          // Show global copy button
           const copyBtn = document.getElementById("copy-queries-btn");
           copyBtn.style.display = "inline-block";
           copyBtn.onclick = () => {
@@ -533,8 +592,13 @@ def index():
             navigator.clipboard.writeText(combined);
             alert("All queries copied to clipboard ✅");
           };
-        });
+        }
+        
+        // Hook up buttons
+        document.getElementById("run-decksurf").addEventListener("click", () => runDeckSurf("json"));
+        document.getElementById("download-deck").addEventListener("click", () => runDeckSurf("apkg"));
         </script>
+
     ''')
 
 
