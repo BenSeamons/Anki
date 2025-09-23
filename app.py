@@ -93,35 +93,27 @@ def practice_tests():
 
 
 def load_apkg_to_df(apkg_file):
-    """
-    Takes an uploaded .apkg file (Werkzeug FileStorage from Flask),
-    extracts collection.anki2, reads notes table, and returns a DataFrame
-    with noteId, Front, Back.
-    """
+    """Extract notes from an uploaded .apkg -> DataFrame(noteId, Front, Back)."""
     with tempfile.TemporaryDirectory() as tmpdir:
         apkg_path = os.path.join(tmpdir, apkg_file.filename)
         apkg_file.save(apkg_path)
 
-        # Unzip .apkg
         with zipfile.ZipFile(apkg_path, "r") as z:
             z.extractall(tmpdir)
 
-        # Find collection.anki2
         db_path = os.path.join(tmpdir, "collection.anki2")
         if not os.path.exists(db_path):
             raise ValueError("No collection.anki2 found in apkg")
 
-        # Read SQLite database
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
         cur.execute("SELECT id, flds FROM notes")
         rows = cur.fetchall()
         conn.close()
 
-        # Build dataframe
         data = []
         for note_id, flds in rows:
-            fields = flds.split("\x1f")  # Anki separator
+            fields = flds.split("\x1f")
             front = fields[0] if len(fields) > 0 else ""
             back = fields[1] if len(fields) > 1 else ""
             data.append({"noteId": note_id, "Front": front, "Back": back})
@@ -132,12 +124,11 @@ def load_apkg_to_df(apkg_file):
 @app.route("/decksurf", methods=["POST"])
 def decksurf():
     try:
-        # 1. Load deck file
+        # --- 1. Load deck ---
         if "deck_file" not in request.files or request.files["deck_file"].filename == "":
             return jsonify({"error": "No deck file uploaded"}), 400
 
         deck_file = request.files["deck_file"]
-
         if deck_file.filename.endswith(".apkg"):
             deck_df = load_apkg_to_df(deck_file)
         elif deck_file.filename.endswith(".txt"):
@@ -157,12 +148,12 @@ def decksurf():
             text = f"{row.get('Front','')} {row.get('Back','')}"
             deck_cards.append({
                 "note_id": int(row["noteId"]),
-                "front": str(row["Front"]),
-                "back": str(row["Back"]),
+                "front": str(row.get("Front","")),
+                "back": str(row.get("Back","")),
                 "text": text
             })
 
-        # 2. Parse objectives
+        # --- 2. Parse objectives ---
         los = []
         if "los_file" in request.files and request.files["los_file"].filename:
             f = request.files["los_file"]
@@ -183,7 +174,7 @@ def decksurf():
         if not los:
             return jsonify({"error": "No learning objectives found"}), 400
 
-        # 3. Embeddings
+        # --- 3. Embeddings + matching ---
         card_texts = [c["text"] for c in deck_cards]
         card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
         alpha = float(request.form.get("alpha", 0.85))
@@ -221,62 +212,33 @@ def decksurf():
                 "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
             })
 
-        # 4. Build unsuspended deck
-        deck_name = request.form.get("deck_name", "Uploaded Deck")
-        deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
-        gen_deck = genanki.Deck(deck_id, deck_name)
-        basic_model = genanki.Model(
-            1607392319, "Basic Model",
-            fields=[{'name': 'Front'}, {'name': 'Back'}],
-            templates=[{'name': 'Card 1', 'qfmt': '{{Front}}', 'afmt': '{{Front}}<br>{{Back}}'}]
-        )
-
-        for c in deck_cards:
-            note = genanki.Note(
-                model=basic_model,
-                fields=[c["front"], c["back"]],
-                tags=["unsuspended"] if c["note_id"] in matched_ids else ["suspended"]
-            )
-            gen_deck.add_note(note)
-
-        package = genanki.Package(gen_deck)
-        deck_data = io.BytesIO()
-        package.write_to_file(deck_data)
-        deck_data.seek(0)
-
+        # --- 4. Export .apkg with only matched cards ---
         mode = request.form.get("mode", "json")
         if mode == "apkg":
+            deck_name = request.form.get("deck_name", "Uploaded Deck")
+            cards = [(c["front"], c["back"]) for c in deck_cards if c["note_id"] in matched_ids]
+
+            deck_data = io.BytesIO()
+            ApkgWriter(deck_name, cards).write_to_file(deck_data)
+            deck_data.seek(0)
+
             return send_file(
                 deck_data,
                 as_attachment=True,
                 download_name=f"{deck_name}_unsuspended.apkg",
                 mimetype="application/octet-stream"
             )
-        else:
-            return jsonify({"stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
-                            "results": results})
+
+        # --- Default: JSON for frontend ---
+        return jsonify({
+            "stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
+            "results": results
+        })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
-
-        # --- 7. Build new deck with unsuspended matches ---
-        deck_name = request.form.get("deck_name", "Uploaded Deck")
-        deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
-
-        gen_deck = genanki.Deck(deck_id, deck_name)
-        basic_model = genanki.Model(
-            1607392319,
-            'Basic Model',
-            fields=[{'name': 'Front'}, {'name': 'Back'}],
-            templates=[{
-                'name': 'Card 1',
-                'qfmt': '{{Front}}',
-                'afmt': '{{Front}}<br>{{Back}}'
-            }]
-        )
 
         matched_ids = {m["note_id"] for r in results for m in r["matches"]}
 
@@ -303,7 +265,7 @@ def decksurf():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": str(e)}), 500)
 
 @app.route('/')
 def home():
