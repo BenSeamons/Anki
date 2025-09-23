@@ -367,19 +367,85 @@ def index():
        <!-- DeckSurfer Mapper -->
         <div class="half">
           <h2>DeckSurfer Mapper</h2>
-          <form method="POST" action="/decksurf" enctype="multipart/form-data" target="_blank">
+          <form id="decksurf-form" enctype="multipart/form-data">
             <label>Upload Deck CSV:</label><br>
-            <input type="file" name="deck_file" accept=".csv" required><br><br>
+            <input type="file" id="deck_file" name="deck_file" accept=".csv" required><br><br>
         
             <label>Upload Lecture Objectives (PDF/CSV/TXT):</label><br>
-            <input type="file" name="los_file" accept=".pdf,.csv,.txt"><br><br>
+            <input type="file" id="los_file" name="los_file" accept=".pdf,.csv,.txt"><br><br>
         
             <label>Or paste objectives:</label><br>
-            <textarea name="text" rows="8" placeholder="One objective per line"></textarea><br><br>
+            <textarea id="los_text" name="text" rows="8" placeholder="One objective per line"></textarea><br><br>
         
             <button type="submit">Run DeckSurf</button>
           </form>
+        
+          <div id="decksurf-results" style="margin-top:20px;"></div>
+          <button id="copy-queries-btn" style="display:none;margin-top:10px;">Copy All Search Queries</button>
         </div>
+        
+        <script>
+        document.getElementById("decksurf-form").addEventListener("submit", async (e) => {
+          e.preventDefault();
+        
+          const formData = new FormData();
+          const deckFile = document.getElementById("deck_file").files[0];
+          const losFile = document.getElementById("los_file").files[0];
+          const losText = document.getElementById("los_text").value.trim();
+        
+          if (!deckFile) {
+            alert("Please upload a deck CSV file");
+            return;
+          }
+          formData.append("deck_file", deckFile);
+          if (losFile) formData.append("los_file", losFile);
+          if (losText) formData.append("text", losText);
+        
+          const resultsBox = document.getElementById("decksurf-results");
+          resultsBox.innerHTML = "<p>Processing... ⏳</p>";
+        
+          const response = await fetch("/decksurf", { method: "POST", body: formData });
+          const data = await response.json();
+        
+          if (data.error) {
+            resultsBox.innerHTML = `<p style="color:red;">Error: ${data.error}</p>`;
+            return;
+          }
+        
+          // Build results table
+          let html = `<h3>Results</h3>`;
+          let allQueries = [];
+        
+          data.results.forEach((res, idx) => {
+            html += `
+              <div style="border:1px solid #ccc;padding:10px;margin-bottom:10px;">
+                <b>LO ${idx+1}: ${res.learning_objective}</b><br>
+                <ul>
+            `;
+            res.matches.forEach(m => {
+              html += `<li><code>nid:${m.note_id}</code> — ${m.preview} (score: ${m.score.toFixed(2)})</li>`;
+            });
+            html += `
+                </ul>
+                <p><b>Search Query:</b> <code>${res.search_query}</code></p>
+                <button onclick="navigator.clipboard.writeText('${res.search_query}')">Copy Query</button>
+              </div>
+            `;
+            allQueries.push(res.search_query);
+          });
+        
+          resultsBox.innerHTML = html;
+        
+          // Show global copy button
+          const copyBtn = document.getElementById("copy-queries-btn");
+          copyBtn.style.display = "inline-block";
+          copyBtn.onclick = () => {
+            const combined = allQueries.join(" OR ");
+            navigator.clipboard.writeText(combined);
+            alert("All queries copied to clipboard ✅");
+          };
+        });
+        </script>
     ''')
 
 
