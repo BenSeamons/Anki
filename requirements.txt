@@ -14,4 +14,4 @@ torch
 requests
 PyPDF2
 pandas
-
+anki-export
