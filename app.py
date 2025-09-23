@@ -6,10 +6,14 @@ import hashlib
 import tempfile
 import pandas as pd
 from PyPDF2 import PdfReader
+from rapidfuzz import fuzz
+from sentence_transformers import SentenceTransformer
+import numpy as np
 from just_PDFs import generate_practice_test_return_text
 
 app = Flask(__name__)
 
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 # Simple parser to convert pasted text into cards list
@@ -85,36 +89,97 @@ def practice_tests():
                 html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
         return html
 
-@app.route('/decksurf', methods=['POST'])
+@app.route("/decksurf", methods=["POST"])
 def decksurf():
-    # Accept either file upload or pasted text
-    los = []
-    if 'file' in request.files and request.files['file'].filename:
-        f = request.files['file']
-        filename = f.filename.lower()
-        if filename.endswith('.pdf'):
-            reader = PdfReader(f)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
-            # crude LO split
-            los = [line.strip() for line in text.split("\n") if 20 < len(line.strip()) < 250]
-        elif filename.endswith('.csv'):
-            df = pd.read_csv(f)
-            col = df.columns[0]
-            los = df[col].dropna().astype(str).tolist()
-        elif filename.endswith('.txt'):
-            los = [line.strip() for line in f.read().decode('utf-8').splitlines() if line.strip()]
-    elif request.form.get('text'):
-        los = [line.strip() for line in request.form['text'].splitlines() if line.strip()]
+    try:
+        # --- 1. Parse Deck CSV ---
+        if "deck_file" not in request.files:
+            return jsonify({"error": "No deck file uploaded"}), 400
 
-    if not los:
-        return "No learning objectives found.", 400
+        deck_file = request.files["deck_file"]
+        deck_df = pd.read_csv(deck_file)
 
-    # For now, just echo them back (you can plug in Deck_Sorter here later)
-    html = "<h2>Extracted Learning Objectives</h2><ul>"
-    for lo in los[:30]:  # cap for readability
-        html += f"<li>{lo}</li>"
-    html += "</ul>"
-    return html
+        # Require noteId, Front, Back
+        if not all(col in deck_df.columns for col in ["noteId", "Front", "Back"]):
+            return jsonify({"error": "Deck CSV must have noteId, Front, Back columns"}), 400
+
+        deck_cards = []
+        for _, row in deck_df.iterrows():
+            card_text = f"{row.get('Front','')} {row.get('Back','')}"
+            deck_cards.append({
+                "note_id": int(row.get("noteId")),
+                "front": str(row.get("Front","")),
+                "back": str(row.get("Back","")),
+                "tags": row.get("Tags",""),
+                "text": card_text
+            })
+
+        # --- 2. Parse Lecture Objectives ---
+        los = []
+        if "los_file" in request.files and request.files["los_file"].filename:
+            f = request.files["los_file"]
+            fname = f.filename.lower()
+            if fname.endswith(".pdf"):
+                reader = PdfReader(f)
+                raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                los = [line.strip() for line in raw_text.split("\n") if 20 < len(line.strip()) < 250]
+            elif fname.endswith(".csv"):
+                df = pd.read_csv(f)
+                col = df.columns[0]
+                los = df[col].dropna().astype(str).tolist()
+            elif fname.endswith(".txt"):
+                los = [line.strip() for line in f.read().decode("utf-8").splitlines() if line.strip()]
+        elif "text" in request.form:
+            los = [line.strip() for line in request.form["text"].splitlines() if line.strip()]
+
+        if not los:
+            return jsonify({"error": "No learning objectives found"}), 400
+
+        # --- 3. Build Embedding Index ---
+        card_texts = [c["text"] for c in deck_cards]
+        card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
+
+        # --- 4. Match Each LO ---
+        results = []
+        alpha = 0.6  # weight embeddings more
+        for lo in los:
+            lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
+            emb_scores = card_embeddings @ lo_vec
+            fz_scores = np.array([
+                0.5 * fuzz.token_set_ratio(lo, c["text"]) / 100.0 +
+                0.3 * fuzz.partial_ratio(lo, c["text"]) / 100.0 +
+                0.2 * fuzz.token_sort_ratio(lo, c["text"]) / 100.0
+                for c in deck_cards
+            ])
+            combo_scores = alpha * emb_scores + (1 - alpha) * fz_scores
+            idxs = np.argsort(-combo_scores)[:3]
+
+            matches, note_ids = [], []
+            for i in idxs:
+                c = deck_cards[i]
+                matches.append({
+                    "note_id": c["note_id"],
+                    "preview": (c["front"][:100] + " ...") if len(c["front"]) > 100 else c["front"],
+                    "score": float(combo_scores[i])
+                })
+                note_ids.append(c["note_id"])
+
+            results.append({
+                "learning_objective": lo,
+                "matches": matches,
+                "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
+            })
+
+        return jsonify({
+            "stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
+            "results": results
+        })
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 
 
 @app.route('/')
@@ -299,14 +364,19 @@ def index():
       </div>
     </body>
     </html>
-        <!-- DeckSurfer Mapper -->
+       <!-- DeckSurfer Mapper -->
         <div class="half">
           <h2>DeckSurfer Mapper</h2>
-          <form method="POST" action="/decksurf" enctype="multipart/form-data">
-            <label for="decksurf_file">Upload PDF/CSV/TXT:</label><br>
-            <input type="file" id="decksurf_file" name="file" accept=".pdf,.csv,.txt"><br><br>
-            <label for="decksurf_text">Or paste objectives:</label><br>
-            <textarea id="decksurf_text" name="text" rows="10" placeholder="One objective per line"></textarea><br><br>
+          <form method="POST" action="/decksurf" enctype="multipart/form-data" target="_blank">
+            <label>Upload Deck CSV:</label><br>
+            <input type="file" name="deck_file" accept=".csv" required><br><br>
+        
+            <label>Upload Lecture Objectives (PDF/CSV/TXT):</label><br>
+            <input type="file" name="los_file" accept=".pdf,.csv,.txt"><br><br>
+        
+            <label>Or paste objectives:</label><br>
+            <textarea name="text" rows="8" placeholder="One objective per line"></textarea><br><br>
+        
             <button type="submit">Run DeckSurf</button>
           </form>
         </div>
