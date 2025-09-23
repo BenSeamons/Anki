@@ -1,4 +1,5 @@
 from flask import Flask, request, render_template_string, send_file, jsonify
+import sqlite3, zipfile, tempfile
 import io
 import genanki
 import os
@@ -89,96 +90,142 @@ def practice_tests():
                 html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
         return html
 
+
+def load_apkg_to_df(apkg_file):
+    """
+    Takes an uploaded .apkg file (Werkzeug FileStorage from Flask),
+    extracts collection.anki2, reads notes table, and returns a DataFrame
+    with noteId, Front, Back.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        apkg_path = os.path.join(tmpdir, apkg_file.filename)
+        apkg_file.save(apkg_path)
+
+        # Unzip .apkg
+        with zipfile.ZipFile(apkg_path, "r") as z:
+            z.extractall(tmpdir)
+
+        # Find collection.anki2
+        db_path = os.path.join(tmpdir, "collection.anki2")
+        if not os.path.exists(db_path):
+            raise ValueError("No collection.anki2 found in apkg")
+
+        # Read SQLite database
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        cur.execute("SELECT id, flds FROM notes")
+        rows = cur.fetchall()
+        conn.close()
+
+        # Build dataframe
+        data = []
+        for note_id, flds in rows:
+            fields = flds.split("\x1f")  # Anki separator
+            front = fields[0] if len(fields) > 0 else ""
+            back = fields[1] if len(fields) > 1 else ""
+            data.append({"noteId": note_id, "Front": front, "Back": back})
+
+        return pd.DataFrame(data)
+
+
 @app.route("/decksurf", methods=["POST"])
 def decksurf():
     try:
-        # --- 1. Parse Deck CSV ---
-        if "deck_file" not in request.files:
-            return jsonify({"error": "No deck file uploaded"}), 400
+        if deck_file.filename.endswith(".apkg"):
+            deck_df = load_apkg_to_df(deck_file)
+        elif deck_file.filename.endswith(".txt"):
+            deck_df = pd.read_csv(deck_file, sep="\t", engine="python", on_bad_lines="skip")
+            # add fake IDs if needed
+        if "noteId" not in deck_df.columns:
+            deck_df["noteId"] = range(len(deck_df))
+    else:
+        deck_df = pd.read_csv(deck_file, engine="python", on_bad_lines="skip")
 
-        deck_file = request.files["deck_file"]
-        deck_df = pd.read_csv(deck_file, sep="\t", engine="python", on_bad_lines="skip")
-
-        # Require noteId, Front, Back
-        if not all(col in deck_df.columns for col in ["noteId", "Front", "Back"]):
-            return jsonify({"error": "Deck CSV must have noteId, Front, Back columns"}), 400
-
-        deck_cards = []
-        for _, row in deck_df.iterrows():
-            card_text = f"{row.get('Front','')} {row.get('Back','')}"
-            deck_cards.append({
-                "note_id": int(row.get("noteId")),
-                "front": str(row.get("Front","")),
-                "back": str(row.get("Back","")),
-                "tags": row.get("Tags",""),
-                "text": card_text
-            })
-
-        # --- 2. Parse Lecture Objectives ---
-        los = []
-        if "los_file" in request.files and request.files["los_file"].filename:
-            f = request.files["los_file"]
-            fname = f.filename.lower()
-            if fname.endswith(".pdf"):
-                reader = PdfReader(f)
-                raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                los = [line.strip() for line in raw_text.split("\n") if 20 < len(line.strip()) < 250]
-            elif fname.endswith(".csv"):
-                df = pd.read_csv(f)
-                col = df.columns[0]
-                los = df[col].dropna().astype(str).tolist()
-            elif fname.endswith(".txt"):
-                los = [line.strip() for line in f.read().decode("utf-8").splitlines() if line.strip()]
-        elif "text" in request.form:
-            los = [line.strip() for line in request.form["text"].splitlines() if line.strip()]
-
-        if not los:
-            return jsonify({"error": "No learning objectives found"}), 400
-
-        # --- 3. Build Embedding Index ---
-        card_texts = [c["text"] for c in deck_cards]
-        card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
-
-        # --- 4. Match Each LO ---
-        results = []
-        alpha = 0.6  # weight embeddings more
-        for lo in los:
-            lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
-            emb_scores = card_embeddings @ lo_vec
-            fz_scores = np.array([
-                0.5 * fuzz.token_set_ratio(lo, c["text"]) / 100.0 +
-                0.3 * fuzz.partial_ratio(lo, c["text"]) / 100.0 +
-                0.2 * fuzz.token_sort_ratio(lo, c["text"]) / 100.0
-                for c in deck_cards
-            ])
-            combo_scores = alpha * emb_scores + (1 - alpha) * fz_scores
-            idxs = np.argsort(-combo_scores)[:3]
-
-            matches, note_ids = [], []
-            for i in idxs:
-                c = deck_cards[i]
-                matches.append({
-                    "note_id": c["note_id"],
-                    "preview": (c["front"][:100] + " ...") if len(c["front"]) > 100 else c["front"],
-                    "score": float(combo_scores[i])
+    # Validate required columns
+    required_cols = {"noteId", "Front", "Back"}
+    if not required_cols.issubset(set(deck_df.columns)):
+        return jsonify({"error": "Deck file must have noteId, Front, Back columns"}), 400
+    
+            # Require noteId, Front, Back
+            if not all(col in deck_df.columns for col in ["noteId", "Front", "Back"]):
+                return jsonify({"error": "Deck CSV must have noteId, Front, Back columns"}), 400
+    
+            deck_cards = []
+            for _, row in deck_df.iterrows():
+                card_text = f"{row.get('Front','')} {row.get('Back','')}"
+                deck_cards.append({
+                    "note_id": int(row.get("noteId")),
+                    "front": str(row.get("Front","")),
+                    "back": str(row.get("Back","")),
+                    "tags": row.get("Tags",""),
+                    "text": card_text
                 })
-                note_ids.append(c["note_id"])
-
-            results.append({
-                "learning_objective": lo,
-                "matches": matches,
-                "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
+    
+            # --- 2. Parse Lecture Objectives ---
+            los = []
+            if "los_file" in request.files and request.files["los_file"].filename:
+                f = request.files["los_file"]
+                fname = f.filename.lower()
+                if fname.endswith(".pdf"):
+                    reader = PdfReader(f)
+                    raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
+                    los = [line.strip() for line in raw_text.split("\n") if 20 < len(line.strip()) < 250]
+                elif fname.endswith(".csv"):
+                    df = pd.read_csv(f)
+                    col = df.columns[0]
+                    los = df[col].dropna().astype(str).tolist()
+                elif fname.endswith(".txt"):
+                    los = [line.strip() for line in f.read().decode("utf-8").splitlines() if line.strip()]
+            elif "text" in request.form:
+                los = [line.strip() for line in request.form["text"].splitlines() if line.strip()]
+    
+            if not los:
+                return jsonify({"error": "No learning objectives found"}), 400
+    
+            # --- 3. Build Embedding Index ---
+            card_texts = [c["text"] for c in deck_cards]
+            card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
+    
+            # --- 4. Match Each LO ---
+            results = []
+            alpha = 0.6  # weight embeddings more
+            for lo in los:
+                lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
+                emb_scores = card_embeddings @ lo_vec
+                fz_scores = np.array([
+                    0.5 * fuzz.token_set_ratio(lo, c["text"]) / 100.0 +
+                    0.3 * fuzz.partial_ratio(lo, c["text"]) / 100.0 +
+                    0.2 * fuzz.token_sort_ratio(lo, c["text"]) / 100.0
+                    for c in deck_cards
+                ])
+                combo_scores = alpha * emb_scores + (1 - alpha) * fz_scores
+                idxs = np.argsort(-combo_scores)[:3]
+    
+                matches, note_ids = [], []
+                for i in idxs:
+                    c = deck_cards[i]
+                    matches.append({
+                        "note_id": c["note_id"],
+                        "preview": (c["front"][:100] + " ...") if len(c["front"]) > 100 else c["front"],
+                        "score": float(combo_scores[i])
+                    })
+                    note_ids.append(c["note_id"])
+    
+                results.append({
+                    "learning_objective": lo,
+                    "matches": matches,
+                    "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
+                })
+    
+            return jsonify({
+                "stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
+                "results": results
             })
-
-        return jsonify({
-            "stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
-            "results": results
-        })
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return jsonify({"error": str(e)}), 500
 
 
 
