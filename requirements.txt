@@ -6,3 +6,11 @@ google-auth
 google-auth-oauthlib
 google-api-python-client
 pytest
+
+rapidfuzz
+sentence-transformers
+numpy
+torch
+requests
+PyPDF2
+
