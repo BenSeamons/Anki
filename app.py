@@ -138,8 +138,8 @@ def decksurf():
             # add fake IDs if needed
         if "noteId" not in deck_df.columns:
             deck_df["noteId"] = range(len(deck_df))
-    else:
-        deck_df = pd.read_csv(deck_file, engine="python", on_bad_lines="skip")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500)
 
     # Validate required columns
     required_cols = {"noteId", "Front", "Back"}
