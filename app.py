@@ -191,7 +191,7 @@ def decksurf():
         card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
 
         results = []
-        alpha = 0.6
+        alpha = float(request.form.get("alpha", 0.85))  # default to 0.85
         for lo in los:
             lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
             emb_scores = card_embeddings @ lo_vec
@@ -214,16 +214,45 @@ def decksurf():
                 })
                 note_ids.append(c["note_id"])
 
-            results.append({
-                "learning_objective": lo,
-                "matches": matches,
-                "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
-            })
+            # --- Build a new .apkg with matched cards unsuspended ---
+            deck_name = request.form.get("deck_name", "Uploaded Deck")
+            deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
+            
+            gen_deck = genanki.Deck(deck_id, deck_name)
+            
+            basic_model = genanki.Model(
+                1607392319,
+                'Basic Model',
+                fields=[{'name': 'Front'}, {'name': 'Back'}],
+                templates=[{
+                    'name': 'Card 1',
+                    'qfmt': '{{Front}}',
+                    'afmt': '{{Front}}<br>{{Back}}'
+                }]
+            )
+            
+            matched_ids = {m["note_id"] for r in results for m in r["matches"]}
+            
+            for c in deck_cards:
+                note = genanki.Note(
+                    model=basic_model,
+                    fields=[c["front"], c["back"]],
+                    tags=["unsuspended"] if c["note_id"] in matched_ids else ["suspended"]
+                )
+                gen_deck.add_note(note)
+            
+            package = genanki.Package(gen_deck)
+            deck_data = io.BytesIO()
+            package.write_to_file(deck_data)
+            deck_data.seek(0)
+            
+            return send_file(
+                deck_data,
+                as_attachment=True,
+                download_name=f"{deck_name}_unsuspended.apkg",
+                mimetype="application/octet-stream"
+            )
 
-        return jsonify({
-            "stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
-            "results": results
-        })
 
     except Exception as e:
         import traceback
@@ -418,13 +447,19 @@ def index():
           <h2>DeckSurfer Mapper</h2>
           <form id="decksurf-form" enctype="multipart/form-data">
             <label>Upload Deck CSV:</label><br>
-            <input type="file" id="deck_file" name="deck_file" accept=".csv" required><br><br>
+            <input type="file" id="deck_file" name="deck_file" accept=".apkg,.csv,.txt" required>
         
             <label>Upload Lecture Objectives (PDF/CSV/TXT):</label><br>
             <input type="file" id="los_file" name="los_file" accept=".pdf,.csv,.txt"><br><br>
         
             <label>Or paste objectives:</label><br>
             <textarea id="los_text" name="text" rows="8" placeholder="One objective per line"></textarea><br><br>
+
+            <label for="alpha">Semantic Weight (α):</label><br>
+            <input type="range" id="alpha" name="alpha" min="0" max="1" step="0.05" value="0.85"
+                   oninput="alphaValue.value = this.value">
+            <output id="alphaValue">0.85</output><br><br>
+
         
             <button type="submit">Run DeckSurf</button>
           </form>
