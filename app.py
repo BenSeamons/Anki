@@ -9,6 +9,7 @@ import pandas as pd
 from PyPDF2 import PdfReader
 from rapidfuzz import fuzz
 from sentence_transformers import SentenceTransformer
+from anki_export import ApkgWriter
 import numpy as np
 from just_PDFs import generate_practice_test_return_text
 
