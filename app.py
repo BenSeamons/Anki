@@ -131,12 +131,13 @@ def load_apkg_to_df(apkg_file):
 @app.route("/decksurf", methods=["POST"])
 def decksurf():
     try:
-        # 1. Load deck file
+        # --- 1. Validate deck upload ---
         if "deck_file" not in request.files or request.files["deck_file"].filename == "":
             return jsonify({"error": "No deck file uploaded"}), 400
 
         deck_file = request.files["deck_file"]
 
+        # --- 2. Load deck ---
         if deck_file.filename.endswith(".apkg"):
             deck_df = load_apkg_to_df(deck_file)
         elif deck_file.filename.endswith(".txt"):
@@ -144,16 +145,14 @@ def decksurf():
         else:
             deck_df = pd.read_csv(deck_file, engine="python", on_bad_lines="skip")
 
-        # Add fake IDs if missing
         if "noteId" not in deck_df.columns:
             deck_df["noteId"] = range(len(deck_df))
 
-        # Validate required columns
         required_cols = {"noteId", "Front", "Back"}
         if not required_cols.issubset(set(deck_df.columns)):
             return jsonify({"error": "Deck file must have noteId, Front, Back columns"}), 400
 
-        # 2. Build deck cards list
+        # --- 3. Convert to card dicts ---
         deck_cards = []
         for _, row in deck_df.iterrows():
             card_text = f"{row.get('Front','')} {row.get('Back','')}"
@@ -165,7 +164,7 @@ def decksurf():
                 "text": card_text
             })
 
-        # 3. Parse learning objectives (PDF/CSV/TXT or textarea)
+        # --- 4. Parse learning objectives ---
         los = []
         if "los_file" in request.files and request.files["los_file"].filename:
             f = request.files["los_file"]
@@ -186,12 +185,14 @@ def decksurf():
         if not los:
             return jsonify({"error": "No learning objectives found"}), 400
 
-        # 4. Embed & match
+        # --- 5. Embed cards ---
         card_texts = [c["text"] for c in deck_cards]
         card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
 
         results = []
-        alpha = float(request.form.get("alpha", 0.85))  # default to 0.85
+        alpha = float(request.form.get("alpha", 0.85))  # default weight for embeddings
+
+        # --- 6. Match each LO ---
         for lo in los:
             lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
             emb_scores = card_embeddings @ lo_vec
@@ -204,7 +205,8 @@ def decksurf():
             combo_scores = alpha * emb_scores + (1 - alpha) * fz_scores
             idxs = np.argsort(-combo_scores)[:3]
 
-            matches, note_ids = [], []
+            matches = []
+            note_ids = []
             for i in idxs:
                 c = deck_cards[i]
                 matches.append({
@@ -214,51 +216,54 @@ def decksurf():
                 })
                 note_ids.append(c["note_id"])
 
-            # --- Build a new .apkg with matched cards unsuspended ---
-            deck_name = request.form.get("deck_name", "Uploaded Deck")
-            deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
-            
-            gen_deck = genanki.Deck(deck_id, deck_name)
-            
-            basic_model = genanki.Model(
-                1607392319,
-                'Basic Model',
-                fields=[{'name': 'Front'}, {'name': 'Back'}],
-                templates=[{
-                    'name': 'Card 1',
-                    'qfmt': '{{Front}}',
-                    'afmt': '{{Front}}<br>{{Back}}'
-                }]
-            )
-            
-            matched_ids = {m["note_id"] for r in results for m in r["matches"]}
-            
-            for c in deck_cards:
-                note = genanki.Note(
-                    model=basic_model,
-                    fields=[c["front"], c["back"]],
-                    tags=["unsuspended"] if c["note_id"] in matched_ids else ["suspended"]
-                )
-                gen_deck.add_note(note)
-            
-            package = genanki.Package(gen_deck)
-            deck_data = io.BytesIO()
-            package.write_to_file(deck_data)
-            deck_data.seek(0)
-            
-            return send_file(
-                deck_data,
-                as_attachment=True,
-                download_name=f"{deck_name}_unsuspended.apkg",
-                mimetype="application/octet-stream"
-            )
+            results.append({
+                "learning_objective": lo,
+                "matches": matches,
+                "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
+            })
 
+        # --- 7. Build new deck with unsuspended matches ---
+        deck_name = request.form.get("deck_name", "Uploaded Deck")
+        deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
+
+        gen_deck = genanki.Deck(deck_id, deck_name)
+        basic_model = genanki.Model(
+            1607392319,
+            'Basic Model',
+            fields=[{'name': 'Front'}, {'name': 'Back'}],
+            templates=[{
+                'name': 'Card 1',
+                'qfmt': '{{Front}}',
+                'afmt': '{{Front}}<br>{{Back}}'
+            }]
+        )
+
+        matched_ids = {m["note_id"] for r in results for m in r["matches"]}
+
+        for c in deck_cards:
+            note = genanki.Note(
+                model=basic_model,
+                fields=[c["front"], c["back"]],
+                tags=["unsuspended"] if c["note_id"] in matched_ids else ["suspended"]
+            )
+            gen_deck.add_note(note)
+
+        package = genanki.Package(gen_deck)
+        deck_data = io.BytesIO()
+        package.write_to_file(deck_data)
+        deck_data.seek(0)
+
+        return send_file(
+            deck_data,
+            as_attachment=True,
+            download_name=f"{deck_name}_unsuspended.apkg",
+            mimetype="application/octet-stream"
+        )
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
-
 
 @app.route('/')
 def home():
