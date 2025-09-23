@@ -97,7 +97,7 @@ def decksurf():
             return jsonify({"error": "No deck file uploaded"}), 400
 
         deck_file = request.files["deck_file"]
-        deck_df = pd.read_csv(deck_file)
+        deck_df = pd.read_csv(deck_file, sep="\t", engine="python", on_bad_lines="skip")
 
         # Require noteId, Front, Back
         if not all(col in deck_df.columns for col in ["noteId", "Front", "Back"]):
