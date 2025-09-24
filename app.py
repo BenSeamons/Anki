@@ -185,63 +185,64 @@ def practice_tests():
 
 def load_apkg_to_df(apkg_file):
     """Extract notes from an uploaded .apkg -> DataFrame(noteId, Front, Back)."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        apkg_path = os.path.join(tmpdir, apkg_file.filename)
-        apkg_file.save(apkg_path)
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            apkg_path = os.path.join(tmpdir, apkg_file.filename)
+            apkg_file.save(apkg_path)
 
-        with zipfile.ZipFile(apkg_path, "r") as z:
-            z.extractall(tmpdir)
+            with zipfile.ZipFile(apkg_path, "r") as z:
+                z.extractall(tmpdir)
 
-        db_path = os.path.join(tmpdir, "collection.anki2")
-        if not os.path.exists(db_path):
-            raise ValueError("No collection.anki2 found in apkg")
+            db_path = os.path.join(tmpdir, "collection.anki2")
+            if not os.path.exists(db_path):
+                raise ValueError("No collection.anki2 found in apkg")
 
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        
-        # DEBUG: Check what tables exist
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        print(f"DEBUG: Raw SQL returned {len(rows)} rows")
-        for i, (note_id, flds) in enumerate(rows):
-            if i < 10:  # Show first 10
-                print(f"DEBUG: Raw row {i}: id={note_id}, flds='{flds[:100]}...'")
-        tables = cur.fetchall()
-        print(f"DEBUG: Available tables: {tables}")
-        
-        # DEBUG: Check notes table structure
-        cur.execute("PRAGMA table_info(notes)")
-        columns = cur.fetchall()
-        print(f"DEBUG: Notes table columns: {columns}")
-        
-        # DEBUG: Count total notes
-        cur.execute("SELECT COUNT(*) FROM notes")
-        total_notes = cur.fetchone()[0]
-        print(f"DEBUG: Total notes in database: {total_notes}")
-        
-        # Get first few notes for inspection
-        cur.execute("SELECT id, flds FROM notes LIMIT 5")
-        sample_rows = cur.fetchall()
-        print(f"DEBUG: First 5 notes:")
-        for note_id, flds in sample_rows:
-            fields = flds.split("\x1f")
-            print(f"  Note {note_id}: {len(fields)} fields - {fields[:2]}")
-        
-        # Get all notes
-        cur.execute("SELECT id, flds FROM notes")
-        rows = cur.fetchall()
-        conn.close()
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            
+            # DEBUG: Check what tables exist
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = cur.fetchall()
+            print(f"DEBUG: Available tables: {tables}")
+            
+            # DEBUG: Check notes table structure
+            cur.execute("PRAGMA table_info(notes)")
+            columns = cur.fetchall()
+            print(f"DEBUG: Notes table columns: {columns}")
+            
+            # DEBUG: Count total notes
+            cur.execute("SELECT COUNT(*) FROM notes")
+            total_notes = cur.fetchone()[0]
+            print(f"DEBUG: Total notes in database: {total_notes}")
+            
+            # Get all notes with error handling
+            try:
+                cur.execute("SELECT id, flds FROM notes")
+                rows = cur.fetchall()
+                print(f"DEBUG: Successfully fetched {len(rows)} rows from SQL")
+            except Exception as e:
+                print(f"DEBUG: SQL query failed: {e}")
+                conn.close()
+                return pd.DataFrame(columns=["noteId", "Front", "Back"])
+            
+            conn.close()
 
-        data = []
-        for note_id, flds in rows:
-            fields = flds.split("\x1f")
-            front = fields[0] if len(fields) > 0 else ""
-            back = fields[1] if len(fields) > 1 else ""
-            # DEBUG: Print each note being processed
-            print(f"DEBUG: Processing note {note_id}: Front='{front[:50]}...', Back='{back[:50]}...'")
-            data.append({"noteId": note_id, "Front": front, "Back": back})
+            data = []
+            for note_id, flds in rows:
+                fields = flds.split("\x1f")
+                front = fields[0] if len(fields) > 0 else ""
+                back = fields[1] if len(fields) > 1 else ""
+                print(f"DEBUG: Processing note {note_id}: Front='{front[:50]}...', Back='{back[:50]}...'")
+                data.append({"noteId": note_id, "Front": front, "Back": back})
 
-        print(f"DEBUG: Extracted {len(data)} notes total")
-        return pd.DataFrame(data)
+            print(f"DEBUG: Extracted {len(data)} notes total")
+            return pd.DataFrame(data)
+            
+    except Exception as e:
+        print(f"DEBUG: Major error in load_apkg_to_df: {e}")
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame(columns=["noteId", "Front", "Back"])
 
 @app.route("/decksurf", methods=["GET", "POST"])
 def decksurf():
