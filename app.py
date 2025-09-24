@@ -265,7 +265,7 @@ def decksurf():
     except Exception as e:
         import traceback
         traceback.print_exc()
-        return jsonify({"error": str(e)}), 500)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/')
 def home():
