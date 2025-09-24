@@ -140,6 +140,31 @@ def load_apkg_to_df(apkg_file):
 
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
+        
+        # DEBUG: Check what tables exist
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = cur.fetchall()
+        print(f"DEBUG: Available tables: {tables}")
+        
+        # DEBUG: Check notes table structure
+        cur.execute("PRAGMA table_info(notes)")
+        columns = cur.fetchall()
+        print(f"DEBUG: Notes table columns: {columns}")
+        
+        # DEBUG: Count total notes
+        cur.execute("SELECT COUNT(*) FROM notes")
+        total_notes = cur.fetchone()[0]
+        print(f"DEBUG: Total notes in database: {total_notes}")
+        
+        # Get first few notes for inspection
+        cur.execute("SELECT id, flds FROM notes LIMIT 5")
+        sample_rows = cur.fetchall()
+        print(f"DEBUG: First 5 notes:")
+        for note_id, flds in sample_rows:
+            fields = flds.split("\x1f")
+            print(f"  Note {note_id}: {len(fields)} fields - {fields[:2]}")
+        
+        # Get all notes
         cur.execute("SELECT id, flds FROM notes")
         rows = cur.fetchall()
         conn.close()
@@ -149,41 +174,12 @@ def load_apkg_to_df(apkg_file):
             fields = flds.split("\x1f")
             front = fields[0] if len(fields) > 0 else ""
             back = fields[1] if len(fields) > 1 else ""
+            # DEBUG: Print each note being processed
+            print(f"DEBUG: Processing note {note_id}: Front='{front[:50]}...', Back='{back[:50]}...'")
             data.append({"noteId": note_id, "Front": front, "Back": back})
 
+        print(f"DEBUG: Extracted {len(data)} notes total")
         return pd.DataFrame(data)
-
-def extract_deck_metadata(apkg_file):
-    """Extract deck name and ID from .apkg file"""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        apkg_path = os.path.join(tmpdir, apkg_file.filename)
-        apkg_file.save(apkg_path)
-
-        with zipfile.ZipFile(apkg_path, "r") as z:
-            z.extractall(tmpdir)
-
-        db_path = os.path.join(tmpdir, "collection.anki2")
-        if not os.path.exists(db_path):
-            raise ValueError("No collection.anki2 found in apkg")
-
-        conn = sqlite3.connect(db_path)
-        cur = conn.cursor()
-        
-        # Get deck info
-        cur.execute("SELECT decks FROM col")
-        decks_json = cur.fetchone()[0]
-        conn.close()
-        
-        import json
-        decks = json.loads(decks_json)
-        
-        # Find the main deck (not default)
-        for deck_id, deck_info in decks.items():
-            if deck_info['name'] != 'Default':
-                return deck_info['name'], int(deck_id)
-        
-        # Fallback
-        return "Imported Deck", 1
 
 @app.route("/decksurf", methods=["GET", "POST"])
 def decksurf():
