@@ -51,7 +51,7 @@ def create_filtered_deck_genanki(deck_name, cards):
     deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
     deck = genanki.Deck(deck_id, deck_name)
     
-    # Basic model for cards
+    # Basic model
     basic_model = genanki.Model(
         1607392319,
         'Basic Model',
@@ -67,21 +67,43 @@ def create_filtered_deck_genanki(deck_name, cards):
             },
         ])
     
+    # Cloze model
+    cloze_model = genanki.Model(
+        1091735104,
+        'Cloze Model',
+        fields=[{'name': 'Text'}],
+        templates=[{
+            'name': 'Cloze Card',
+            'qfmt': '{{cloze:Text}}',
+            'afmt': '{{cloze:Text}}',
+        }],
+        model_type=genanki.Model.CLOZE,
+    )
+
     # Add cards to deck
-    for front, back in cards:
-        note = genanki.Note(
-            model=basic_model,
-            fields=[front, back],
-            tags=['filtered']
-        )
+    for card in cards:
+        if card['is_cloze']:
+            note = genanki.Note(
+                model=cloze_model,
+                fields=[card['front']],
+                tags=['filtered']
+            )
+        else:
+            note = genanki.Note(
+                model=basic_model,
+                fields=[card['front'], card['back']],
+                tags=['filtered']
+            )
         deck.add_note(note)
     
-    # Create package
+    # Create package and return as BytesIO
     package = genanki.Package(deck)
-    deck_data = io.BytesIO()
-    package.write_to_file(deck_data)
-    deck_data.seek(0)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".apkg") as tmp:
+        package.write_to_file(tmp.name)
+        tmp.seek(0)
+        deck_data = io.BytesIO(tmp.read())
     return deck_data
+
 
 def extract_deck_metadata(apkg_file):
     """Extract deck name and ID from .apkg file"""
@@ -451,16 +473,18 @@ def anki_generator():
             deck.add_note(note)
 
         package = genanki.Package(deck)
-        deck_data = io.BytesIO()
-        package.write_to_file(deck_data)
-        deck_data.seek(0)
-
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".apkg") as tmp:
+            package.write_to_file(tmp.name)
+            tmp.seek(0)
+            deck_data = io.BytesIO(tmp.read())
+        
         return send_file(
             deck_data,
             as_attachment=True,
             download_name='custom_deck.apkg',
             mimetype='application/octet-stream'
         )
+
 
     # GET request returns HTML form
     return render_template_string(ANKI_GENERATOR_TEMPLATE)
