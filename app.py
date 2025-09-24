@@ -17,7 +17,6 @@ app = Flask(__name__)
 
 embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-
 # Simple parser to convert pasted text into cards list
 def parse_cards(text):
     cards = []
@@ -47,7 +46,6 @@ def parse_cards(text):
             'is_cloze': is_cloze
         })
     return cards
-
 
 @app.route('/practice-tests', methods=['GET', 'POST'])
 def practice_tests():
@@ -91,7 +89,6 @@ def practice_tests():
                 html += f"<h2>{fname}</h2><pre>{content}</pre><hr>"
         return html
 
-
 def load_apkg_to_df(apkg_file):
     """Extract notes from an uploaded .apkg -> DataFrame(noteId, Front, Back)."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -120,16 +117,62 @@ def load_apkg_to_df(apkg_file):
 
         return pd.DataFrame(data)
 
+def extract_deck_metadata(apkg_file):
+    """Extract deck name and ID from .apkg file"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        apkg_path = os.path.join(tmpdir, apkg_file.filename)
+        apkg_file.save(apkg_path)
 
-@app.route("/decksurf", methods=["POST"])
+        with zipfile.ZipFile(apkg_path, "r") as z:
+            z.extractall(tmpdir)
+
+        db_path = os.path.join(tmpdir, "collection.anki2")
+        if not os.path.exists(db_path):
+            raise ValueError("No collection.anki2 found in apkg")
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        
+        # Get deck info
+        cur.execute("SELECT decks FROM col")
+        decks_json = cur.fetchone()[0]
+        conn.close()
+        
+        import json
+        decks = json.loads(decks_json)
+        
+        # Find the main deck (not default)
+        for deck_id, deck_info in decks.items():
+            if deck_info['name'] != 'Default':
+                return deck_info['name'], int(deck_id)
+        
+        # Fallback
+        return "Imported Deck", 1
+
+@app.route("/decksurf", methods=["GET", "POST"])
 def decksurf():
+    if request.method == "GET":
+        return render_template_string(DECKSURF_TEMPLATE)
+    
     try:
         # --- 1. Load deck ---
         if "deck_file" not in request.files or request.files["deck_file"].filename == "":
             return jsonify({"error": "No deck file uploaded"}), 400
 
         deck_file = request.files["deck_file"]
+        deck_name = "Custom Deck"
+        deck_id = 1
+        
         if deck_file.filename.endswith(".apkg"):
+            # Extract original deck name and ID for preservation
+            try:
+                original_name, original_id = extract_deck_metadata(deck_file)
+                deck_name = original_name
+                deck_id = original_id
+            except:
+                pass
+            # Reset file pointer after metadata extraction
+            deck_file.seek(0)
             deck_df = load_apkg_to_df(deck_file)
         elif deck_file.filename.endswith(".txt"):
             deck_df = pd.read_csv(deck_file, sep="\t", engine="python", on_bad_lines="skip")
@@ -141,7 +184,7 @@ def decksurf():
 
         required_cols = {"noteId", "Front", "Back"}
         if not required_cols.issubset(deck_df.columns):
-            return jsonify({"error": "Deck must have noteId, Front, Back"}), 400
+            return jsonify({"error": "Deck must have noteId, Front, Back columns"}), 400
 
         deck_cards = []
         for _, row in deck_df.iterrows():
@@ -215,52 +258,33 @@ def decksurf():
         # --- 4. Export .apkg with only matched cards ---
         mode = request.form.get("mode", "json")
         if mode == "apkg":
-            deck_name = request.form.get("deck_name", "Uploaded Deck")
             cards = [(c["front"], c["back"]) for c in deck_cards if c["note_id"] in matched_ids]
 
             deck_data = io.BytesIO()
             ApkgWriter(deck_name, cards).write_to_file(deck_data)
             deck_data.seek(0)
 
+            # Use original deck name for download
+            safe_name = "".join(c for c in deck_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            download_name = f"{safe_name}_filtered.apkg"
+
             return send_file(
                 deck_data,
                 as_attachment=True,
-                download_name=f"{deck_name}_unsuspended.apkg",
+                download_name=download_name,
                 mimetype="application/octet-stream"
             )
 
         # --- Default: JSON for frontend ---
         return jsonify({
-            "stats": {"total_objectives": len(los), "deck_size": len(deck_cards)},
+            "stats": {
+                "total_objectives": len(los), 
+                "deck_size": len(deck_cards),
+                "matched_cards": len(matched_ids),
+                "deck_name": deck_name
+            },
             "results": results
         })
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
-        matched_ids = {m["note_id"] for r in results for m in r["matches"]}
-
-        for c in deck_cards:
-            note = genanki.Note(
-                model=basic_model,
-                fields=[c["front"], c["back"]],
-                tags=["unsuspended"] if c["note_id"] in matched_ids else ["suspended"]
-            )
-            gen_deck.add_note(note)
-
-        package = genanki.Package(gen_deck)
-        deck_data = io.BytesIO()
-        package.write_to_file(deck_data)
-        deck_data.seek(0)
-
-        return send_file(
-            deck_data,
-            as_attachment=True,
-            download_name=f"{deck_name}_unsuspended.apkg",
-            mimetype="application/octet-stream"
-        )
 
     except Exception as e:
         import traceback
@@ -273,18 +297,95 @@ def home():
     <html>
       <head>
         <title>Study Tools Hub</title>
+        <style>
+          body {
+            font-family: Arial, sans-serif;
+            margin: 40px;
+            background-color: #f5f5f5;
+          }
+          .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+          }
+          h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+          }
+          .tool-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+          }
+          .tool-card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+            text-decoration: none;
+            color: inherit;
+            transition: transform 0.2s, box-shadow 0.2s;
+          }
+          .tool-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+            text-decoration: none;
+            color: inherit;
+          }
+          .tool-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #495057;
+          }
+          .tool-description {
+            font-size: 14px;
+            color: #6c757d;
+            line-height: 1.4;
+          }
+        </style>
       </head>
       <body>
-        <h1>Welcome to Your Study Tools Hub</h1>
-        <p>Select a tool below:</p>
-        <ul>
-          <li><a href="/anki-generator">Anki Deck Generator (Paste Cards)</a></li>
-        </ul>
+        <div class="container">
+          <h1>📚 Study Tools Hub</h1>
+          <p style="text-align: center; color: #666; margin-bottom: 40px;">
+            Choose from our collection of study tools designed to help students succeed
+          </p>
+          
+          <div class="tool-grid">
+            <a href="/anki-generator" class="tool-card">
+              <div class="tool-title">🃏 Anki Deck Generator</div>
+              <div class="tool-description">
+                Create custom Anki decks by pasting your cards. Supports both basic and cloze deletion formats.
+              </div>
+            </a>
+            
+            <a href="/decksurf" class="tool-card">
+              <div class="tool-title">🎯 DeckSurfer Mapper</div>
+              <div class="tool-description">
+                Upload an Anki deck and learning objectives to find relevant cards and create filtered study decks.
+              </div>
+            </a>
+            
+            <a href="/practice-tests" class="tool-card">
+              <div class="tool-title">📝 Practice Test Generator</div>
+              <div class="tool-description">
+                Upload PDF lectures to automatically generate practice tests and study questions.
+              </div>
+            </a>
+          </div>
+        </div>
       </body>
     </html>
     ''')
+
 @app.route('/anki-generator', methods=['GET', 'POST'])
-def index():
+def anki_generator():
     if request.method == 'POST':
         cards_text = request.form.get('cards_text', '')
         deck_name = request.form.get('deck_name', 'Custom Deck').strip()
@@ -361,210 +462,428 @@ def index():
         )
 
     # GET request returns HTML form
-    return render_template_string('''
-    <html>
-    <head>
-      <title>Study Tools Combined</title>
-      <style>
-        body {
-          font-family: Arial, sans-serif;
-          margin: 20px;
-        }
-        .container {
-          display: flex;
-          gap: 40px;
-        }
-        .half {
-              flex: 1;
-              min-width: 300px;
-              border: 1px solid #ccc;
-              padding: 20px;
-              box-sizing: border-box;
-              height: 90vh;
-              overflow-y: auto;
-        }
-        textarea {
-          width: 100%;
-          box-sizing: border-box;
-        }
-        input[type="text"] {
-          width: 100%;
-          box-sizing: border-box;
-          padding: 6px;
-          margin-bottom: 10px;
-        }
-        button {
-          padding: 10px 15px;
-          font-size: 1em;
-          cursor: pointer;
-        }
-        pre {
-          background: #f0f0f0;
-          padding: 10px;
-          border-radius: 5px;
-          font-family: monospace;
-          white-space: pre-wrap;
-        }
-      </style>
-    </head>
-    <body>
-      <h1>Study Tools Hub</h1>
-      <div class="container">
-        <!-- Anki Deck Generator -->
-        <div class="half">
-          <h2>Anki Deck Generator</h2>
-          <h3>How to generate good cards for this app</h3>
-          <p>To get the best cards, you can ask your AI or note-taking tool using a prompt like this:</p>
-          <pre>
-    Please generate Anki cards for me from this (pdf/powerpoint) in both the Basic and Cloze format.
-    Please give them to me as plain text with the Basic cards front and back separated by a tab.
-    Focus on giving me high yield flashcards that would help a first year med student pass their board exams.
-          </pre>
-          <hr>
-          <p>Or, if you want to generate cards automatically, you can try <a href="https://chatgpt.com/g/g-683f7d2e85348191b074c1875dc79ca7-anki-card-generator" target="_blank" rel="noopener noreferrer">this GPT-powered Anki card generator</a> — <em>use at your own risk!</em></p>
-          <hr>
-          <form method="POST" action="/anki-generator">
-            <label for="deck_name">Deck Name:</label>
-            <input type="text" id="deck_name" name="deck_name" placeholder="Enter deck name" required>
-            <textarea name="cards_text" rows="15" placeholder="Front [tab] Back"></textarea><br>
-            <button type="submit">Generate Anki Deck</button>
-          </form>
-          <p>Use <code>{&#123;&#123;c1::cloze deletion&#125;&#125;}</code> syntax for cloze cards in the Front field. Back can be empty for cloze cards.</p>
-        </div>
+    return render_template_string(ANKI_GENERATOR_TEMPLATE)
 
-        <!-- Practice Test Generator -->
-        <div class="half">
-          <h2>Practice Test Generator</h2>
-          <form method="POST" action="/practice-tests" enctype="multipart/form-data">
-            <label for="pdfs">Upload a Folder of PDFs (Chrome, Edge, Opera support folder upload):</label><br>
-            <p><strong>Note:</strong> Processing your PDFs can take up to <em>10 minutes</em>. Please be patient after submitting the form.</p>
-            <input type="file" id="pdfs" name="pdfs" multiple webkitdirectory accept="application/pdf"><br><br>
-            <label for="individual_pdfs">Or upload Individual PDF files:</label><br>
-            <input type="file" id="individual_pdfs" name="individual_pdfs" multiple accept="application/pdf"><br><br>
+# Template for DeckSurfer
+DECKSURF_TEMPLATE = '''
+<html>
+<head>
+  <title>DeckSurfer - Smart Card Mapper</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background-color: #f5f5f5;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      background: white;
+      padding: 30px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+      text-align: center;
+    }
+    .form-section {
+      margin-bottom: 25px;
+      padding: 20px;
+      background: #f8f9fa;
+      border-radius: 8px;
+    }
+    .form-section h3 {
+      margin-top: 0;
+      color: #495057;
+    }
+    input[type="file"], textarea {
+      width: 100%;
+      padding: 8px;
+      margin: 5px 0;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      box-sizing: border-box;
+    }
+    .slider-container {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    input[type="range"] {
+      flex-grow: 1;
+    }
+    .button-group {
+      display: flex;
+      gap: 10px;
+      margin-top: 20px;
+    }
+    button {
+      padding: 12px 24px;
+      font-size: 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    .btn-primary {
+      background-color: #007bff;
+      color: white;
+    }
+    .btn-primary:hover {
+      background-color: #0056b3;
+    }
+    .btn-success {
+      background-color: #28a745;
+      color: white;
+    }
+    .btn-success:hover {
+      background-color: #1e7e34;
+    }
+    .btn-secondary {
+      background-color: #6c757d;
+      color: white;
+    }
+    .btn-secondary:hover {
+      background-color: #545b62;
+    }
+    #decksurf-results {
+      margin-top: 30px;
+    }
+    .match-result {
+      border: 1px solid #dee2e6;
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 15px;
+      background: white;
+    }
+    .match-result h4 {
+      margin-top: 0;
+      color: #495057;
+    }
+    .card-match {
+      background: #e9ecef;
+      padding: 8px;
+      margin: 5px 0;
+      border-radius: 4px;
+      font-family: monospace;
+    }
+    .search-query {
+      background: #f8f9fa;
+      padding: 10px;
+      border-radius: 4px;
+      border: 1px solid #e9ecef;
+      margin-top: 10px;
+    }
+    .stats-box {
+      background: #d4edda;
+      border: 1px solid #c3e6cb;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎯 DeckSurfer - Smart Card Mapper</h1>
+    <p style="text-align: center; color: #666;">
+      Upload your Anki deck and learning objectives to automatically find and extract relevant cards
+    </p>
 
-            <button type="submit">Generate Practice Tests</button>
-          </form>
-          <p><small>Note: Folder upload works only in Chrome, Edge, and Opera. Firefox does not support folder upload.</small></p>
-        </div>
+    <form id="decksurf-form" enctype="multipart/form-data">
+      <div class="form-section">
+        <h3>📚 Upload Your Anki Deck</h3>
+        <label>Select deck file (.apkg, .csv, .txt):</label>
+        <input type="file" id="deck_file" name="deck_file" accept=".apkg,.csv,.txt" required>
+        <small style="color: #6c757d;">
+          Supports Anki packages (.apkg), CSV files, or tab-separated text files
+        </small>
       </div>
-    </body>
-    </html>
-       <!-- DeckSurfer Mapper -->
-        <div class="half">
-          <h2>DeckSurfer Mapper</h2>
-          <form id="decksurf-form" enctype="multipart/form-data">
-            <label>Upload Deck (.apkg, .csv, .txt):</label><br>
-            <input type="file" id="deck_file" name="deck_file" accept=".apkg,.csv,.txt" required><br><br>
+
+      <div class="form-section">
+        <h3>🎯 Learning Objectives</h3>
+        <label>Upload objectives file (PDF/CSV/TXT):</label>
+        <input type="file" id="los_file" name="los_file" accept=".pdf,.csv,.txt">
         
-            <label>Upload Lecture Objectives (PDF/CSV/TXT):</label><br>
-            <input type="file" id="los_file" name="los_file" accept=".pdf,.csv,.txt"><br><br>
-        
-            <label>Or paste objectives:</label><br>
-            <textarea id="los_text" name="text" rows="8" placeholder="One objective per line"></textarea><br><br>
-        
-            <label for="alpha">Semantic Weight (α):</label><br>
-            <input type="range" id="alpha" name="alpha" min="0" max="1" step="0.05" value="0.85"
-                   oninput="alphaValue.value = this.value">
-            <output id="alphaValue">0.85</output><br><br>
-        
-            <!-- Two buttons -->
-            <button type="button" id="run-decksurf">See Matches</button>
-            <button type="button" id="download-deck">Download Deck</button>
-          </form>
-        
-          <div id="decksurf-results" style="margin-top:20px;"></div>
-          <button id="copy-queries-btn" style="display:none;margin-top:10px;">Copy All Search Queries</button>
+        <label style="margin-top: 15px; display: block;">Or paste objectives directly:</label>
+        <textarea id="los_text" name="text" rows="6" placeholder="Enter one learning objective per line..."></textarea>
+        <small style="color: #6c757d;">
+          You can either upload a file or paste objectives directly (one per line)
+        </small>
+      </div>
+
+      <div class="form-section">
+        <h3>⚙️ Matching Settings</h3>
+        <label>Semantic vs Fuzzy Matching Balance:</label>
+        <div class="slider-container">
+          <span>Fuzzy</span>
+          <input type="range" id="alpha" name="alpha" min="0" max="1" step="0.05" value="0.85"
+                 oninput="document.getElementById('alphaValue').textContent = this.value">
+          <span>Semantic</span>
+          <output id="alphaValue" style="font-weight: bold;">0.85</output>
         </div>
-        
-        <script>
-        async function runDeckSurf(mode="json") {
-          const formData = new FormData();
-          const deckFile = document.getElementById("deck_file").files[0];
-          const losFile = document.getElementById("los_file").files[0];
-          const losText = document.getElementById("los_text").value.trim();
-          const alpha = document.getElementById("alpha").value;
-        
-          if (!deckFile) {
-            alert("Please upload a deck file");
-            return;
-          }
-          formData.append("deck_file", deckFile);
-          if (losFile) formData.append("los_file", losFile);
-          if (losText) formData.append("text", losText);
-          formData.append("alpha", alpha);
-          formData.append("mode", mode);
-        
-          if (mode === "apkg") {
-            // Expect a file download
-            const response = await fetch("/decksurf", { method: "POST", body: formData });
-            if (!response.ok) {
-              alert("Error generating deck");
-              return;
-            }
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = "unsuspended_deck.apkg";
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            return;
-          }
-        
-          // Otherwise, expect JSON results
-          const resultsBox = document.getElementById("decksurf-results");
-          resultsBox.innerHTML = "<p>Processing... ⏳</p>";
-        
-          const response = await fetch("/decksurf", { method: "POST", body: formData });
-          const data = await response.json();
-        
-          if (data.error) {
-            resultsBox.innerHTML = `<p style="color:red;">Error: ${data.error}</p>`;
-            return;
-          }
-        
-          // Build results table
-          let html = `<h3>Results</h3>`;
-          let allQueries = [];
-        
-          data.results.forEach((res, idx) => {
-            html += `
-              <div style="border:1px solid #ccc;padding:10px;margin-bottom:10px;">
-                <b>LO ${idx+1}: ${res.learning_objective}</b><br>
-                <ul>
-            `;
-            res.matches.forEach(m => {
-              html += `<li><code>nid:${m.note_id}</code> — ${m.preview} (score: ${m.score.toFixed(2)})</li>`;
-            });
-            html += `
-                </ul>
-                <p><b>Search Query:</b> <code>${res.search_query}</code></p>
-                <button onclick="navigator.clipboard.writeText('${res.search_query}')">Copy Query</button>
-              </div>
-            `;
-            allQueries.push(res.search_query);
-          });
-        
-          resultsBox.innerHTML = html;
-        
-          const copyBtn = document.getElementById("copy-queries-btn");
-          copyBtn.style.display = "inline-block";
-          copyBtn.onclick = () => {
-            const combined = allQueries.join(" OR ");
-            navigator.clipboard.writeText(combined);
-            alert("All queries copied to clipboard ✅");
-          };
+        <small style="color: #6c757d;">
+          Higher values favor semantic similarity, lower values favor exact text matching
+        </small>
+      </div>
+
+      <div class="button-group">
+        <button type="button" id="run-decksurf" class="btn-primary">🔍 Find Matching Cards</button>
+        <button type="button" id="download-deck" class="btn-success">💾 Download Filtered Deck</button>
+      </div>
+    </form>
+
+    <div id="decksurf-results"></div>
+    <button id="copy-queries-btn" class="btn-secondary" style="display:none;margin-top:10px;">
+      📋 Copy All Search Queries
+    </button>
+  </div>
+
+  <script>
+  async function runDeckSurf(mode="json") {
+    const formData = new FormData();
+    const deckFile = document.getElementById("deck_file").files[0];
+    const losFile = document.getElementById("los_file").files[0];
+    const losText = document.getElementById("los_text").value.trim();
+    const alpha = document.getElementById("alpha").value;
+
+    if (!deckFile) {
+      alert("Please upload a deck file");
+      return;
+    }
+    
+    if (!losFile && !losText) {
+      alert("Please either upload a learning objectives file or paste objectives in the text area");
+      return;
+    }
+
+    formData.append("deck_file", deckFile);
+    if (losFile) formData.append("los_file", losFile);
+    if (losText) formData.append("text", losText);
+    formData.append("alpha", alpha);
+    formData.append("mode", mode);
+
+    if (mode === "apkg") {
+      // Show loading state
+      const btn = document.getElementById("download-deck");
+      const originalText = btn.textContent;
+      btn.textContent = "⏳ Generating...";
+      btn.disabled = true;
+
+      try {
+        const response = await fetch("/decksurf", { method: "POST", body: formData });
+        if (!response.ok) {
+          const error = await response.json();
+          alert(`Error: ${error.error || 'Unknown error'}`);
+          return;
         }
-        
-        // Hook up buttons
-        document.getElementById("run-decksurf").addEventListener("click", () => runDeckSurf("json"));
-        document.getElementById("download-deck").addEventListener("click", () => runDeckSurf("apkg"));
-        </script>
+        const blob = await response.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = response.headers.get('Content-Disposition')?.split('filename=')[1] || "filtered_deck.apkg";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.URL.revokeObjectURL(url);
+      } finally {
+        btn.textContent = originalText;
+        btn.disabled = false;
+      }
+      return;
+    }
 
-    ''')
+    // Show loading for results
+    const resultsBox = document.getElementById("decksurf-results");
+    resultsBox.innerHTML = "<p style='text-align: center;'>🔍 Processing and matching cards... ⏳</p>";
 
+    try {
+      const response = await fetch("/decksurf", { method: "POST", body: formData });
+      const data = await response.json();
+
+      if (data.error) {
+        resultsBox.innerHTML = `<p style="color:red; text-align: center;">❌ Error: ${data.error}</p>`;
+        return;
+      }
+
+      // Build results
+      let html = `
+        <div class="stats-box">
+          <h3>📊 Matching Results</h3>
+          <p><strong>Deck:</strong> ${data.stats.deck_name}</p>
+          <p><strong>Total Cards:</strong> ${data.stats.deck_size} | <strong>Learning Objectives:</strong> ${data.stats.total_objectives} | <strong>Matched Cards:</strong> ${data.stats.matched_cards}</p>
+        </div>
+      `;
+
+      let allQueries = [];
+
+      data.results.forEach((res, idx) => {
+        html += `
+          <div class="match-result">
+            <h4>🎯 Objective ${idx+1}</h4>
+            <p><strong>"${res.learning_objective}"</strong></p>
+            <div style="margin: 10px 0;">
+              <strong>Top Matching Cards:</strong>
+        `;
+        res.matches.forEach((m, i) => {
+          html += `
+            <div class="card-match">
+              ${i+1}. <code>nid:${m.note_id}</code> — ${m.preview} 
+              <span style="color: #28a745; font-weight: bold;">(${(m.score * 100).toFixed(1)}%)</span>
+            </div>
+          `;
+        });
+        html += `
+            </div>
+            <div class="search-query">
+              <strong>Anki Search Query:</strong> 
+              <code>${res.search_query}</code>
+              <button onclick="navigator.clipboard.writeText('${res.search_query}')" 
+                      style="margin-left: 10px; padding: 4px 8px; font-size: 12px;" 
+                      class="btn-secondary">Copy</button>
+            </div>
+          </div>
+        `;
+        allQueries.push(res.search_query);
+      });
+
+      resultsBox.innerHTML = html;
+
+      // Show copy all button
+      const copyBtn = document.getElementById("copy-queries-btn");
+      copyBtn.style.display = "inline-block";
+      copyBtn.onclick = () => {
+        const combined = allQueries.join(" OR ");
+        navigator.clipboard.writeText(combined);
+        alert("✅ All search queries copied to clipboard!");
+      };
+
+    } catch (error) {
+      resultsBox.innerHTML = `<p style="color:red; text-align: center;">❌ Error: ${error.message}</p>`;
+    }
+  }
+
+  // Hook up buttons
+  document.getElementById("run-decksurf").addEventListener("click", () => runDeckSurf("json"));
+  document.getElementById("download-deck").addEventListener("click", () => runDeckSurf("apkg"));
+  </script>
+</body>
+</html>
+'''
+
+# Template for Anki Generator  
+ANKI_GENERATOR_TEMPLATE = '''
+<html>
+<head>
+  <title>Anki Deck Generator</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+      background-color: #f5f5f5;
+    }
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      background: white;
+      padding: 30px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+    }
+    h1 {
+      color: #333;
+      text-align: center;
+    }
+    .help-section {
+      background: #e7f3ff;
+      padding: 20px;
+      border-radius: 8px;
+      margin-bottom: 25px;
+    }
+    .help-section h3 {
+      margin-top: 0;
+      color: #0066cc;
+    }
+    label {
+      display: block;
+      margin-bottom: 5px;
+      font-weight: bold;
+      color: #333;
+    }
+    input[type="text"], textarea {
+      width: 100%;
+      padding: 10px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      font-size: 14px;
+      box-sizing: border-box;
+    }
+    textarea {
+      resize: vertical;
+      min-height: 200px;
+    }
+    button {
+      background-color: #007bff;
+      color: white;
+      padding: 12px 24px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 16px;
+      margin-top: 20px;
+    }
+    button:hover {
+      background-color: #0056b3;
+    }
+    .example {
+      background: #f8f9fa;
+      padding: 10px;
+      border-left: 4px solid #007bff;
+      margin: 10px 0;
+      font-family: monospace;
+    }
+    .back-link {
+      display: inline-block;
+      margin-bottom: 20px;
+      color: #007bff;
+      text-decoration: none;
+    }
+    .back-link:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <a href="/" class="back-link">← Back to Hub</a>
+    <h1>🃏 Anki Deck Generator</h1>
+    
+    <div class="help-section">
+      <h3>📖 How to Format Your Cards</h3>
+      <p><strong>Basic Cards:</strong> Use a tab to separate front and back</p>
+      <div class="example">What is the capital of France?	Paris</div>
+      
+      <p><strong>Cloze Deletion:</strong> Use {{c1::answer}} format (no tab needed)</p>
+      <div class="example">The capital of France is {{c1::Paris}}</div>
+      
+      <p><strong>Multiple Clozes:</strong> Use c1, c2, etc. for different deletions</p>
+      <div class="example">{{c1::Napoleon}} was born in {{c2::1769}} in {{c3::Corsica}}</div>
+    </div>
+
+    <form method="POST">
+      <label for="deck_name">Deck Name:</label>
+      <input type="text" id="deck_name" name="deck_name" value="Custom Deck" required>
+
+      <label for="cards_text">Your Cards (one per line):</label>
+      <textarea id="cards_text" name="cards_text" placeholder="Enter your cards here, one per line..." required></textarea>
+
+      <button type="submit">📦 Generate Anki Deck</button>
+    </form>
+  </div>
+</body>
+</html>
+'''
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)
