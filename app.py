@@ -489,6 +489,119 @@ def anki_generator():
     # GET request returns HTML form
     return render_template_string(ANKI_GENERATOR_TEMPLATE)
 
+@app.route('/decksurf', methods=['GET', 'POST'])
+def decksurf():
+    if request.method == 'GET':
+        return render_template_string(DECKSURF_TEMPLATE)
+
+    try:
+        # Input params
+        mode = request.form.get("mode", "json")
+        alpha = float(request.form.get("alpha", 0.85))
+
+        deck_file = request.files.get("deck_file")
+        los_file = request.files.get("los_file")
+        los_text = request.form.get("text", "")
+
+        if not deck_file:
+            return jsonify({"error": "No deck file uploaded"}), 400
+
+        # Load Anki deck into DataFrame
+        df = load_apkg_to_df(deck_file)
+        if df.empty:
+            return jsonify({"error": "Could not parse deck"}), 400
+
+        # Collect learning objectives
+        objectives = []
+        if los_file and los_file.filename:
+            if los_file.filename.lower().endswith(".txt"):
+                objectives = los_file.read().decode("utf-8").splitlines()
+            elif los_file.filename.lower().endswith(".csv"):
+                import pandas as pd
+                df_los = pd.read_csv(los_file)
+                objectives = df_los.iloc[:, 0].dropna().astype(str).tolist()
+            elif los_file.filename.lower().endswith(".pdf"):
+                reader = PdfReader(los_file)
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        objectives.extend(text.splitlines())
+        if los_text:
+            objectives.extend(l.strip() for l in los_text.splitlines() if l.strip())
+
+        if not objectives:
+            return jsonify({"error": "No learning objectives provided"}), 400
+
+        # Embed deck cards and objectives
+        card_texts = df["Front"].fillna("").tolist()
+        card_embeddings = embed_model.encode(card_texts, convert_to_numpy=True, normalize_embeddings=True)
+        obj_embeddings = embed_model.encode(objectives, convert_to_numpy=True, normalize_embeddings=True)
+
+        results = []
+        for i, obj in enumerate(objectives):
+            obj_emb = obj_embeddings[i]
+
+            matches = []
+            for j, row in df.iterrows():
+                # Semantic similarity (cosine dot product)
+                semantic_score = float(np.dot(obj_emb, card_embeddings[j]))
+
+                # Fuzzy similarity
+                fuzzy_score = fuzz.partial_ratio(obj, row["Front"]) / 100.0
+
+                # Alpha-blend the two
+                score = alpha * semantic_score + (1 - alpha) * fuzzy_score
+
+                matches.append({
+                    "note_id": row["noteId"],
+                    "preview": row["Front"][:100].replace("\n", " "),
+                    "score": score
+                })
+
+            matches = sorted(matches, key=lambda x: -x["score"])[:5]
+
+            results.append({
+                "learning_objective": obj,
+                "matches": matches,
+                "search_query": " OR ".join([f"nid:{m['note_id']}" for m in matches])
+            })
+
+        if mode == "json":
+            return jsonify({
+                "stats": {
+                    "deck_name": "Uploaded Deck",
+                    "deck_size": len(df),
+                    "total_objectives": len(objectives),
+                    "matched_cards": sum(len(r["matches"]) for r in results)
+                },
+                "results": results
+            })
+
+        elif mode == "apkg":
+            matched_cards = []
+            for r in results:
+                for m in r["matches"]:
+                    row = df.loc[df["noteId"] == m["note_id"]].iloc[0]
+                    matched_cards.append({
+                        "front": row["Front"],
+                        "back": row["Back"],
+                        "is_cloze": "{{c" in row["Front"]
+                    })
+
+            deck_data = create_filtered_deck_genanki("Filtered Deck", matched_cards)
+            return send_file(
+                deck_data,
+                as_attachment=True,
+                download_name="filtered_deck.apkg",
+                mimetype="application/octet-stream"
+            )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
 # Template for DeckSurfer
 DECKSURF_TEMPLATE = '''
 <html>
