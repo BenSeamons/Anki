@@ -189,202 +189,109 @@ def load_apkg_to_df(apkg_file):
         with tempfile.TemporaryDirectory() as tmpdir:
             apkg_path = os.path.join(tmpdir, apkg_file.filename)
             apkg_file.save(apkg_path)
+            
+            print(f"DEBUG: Saved .apkg to {apkg_path}, size: {os.path.getsize(apkg_path)} bytes")
 
+            # Extract the zip file
             with zipfile.ZipFile(apkg_path, "r") as z:
+                print(f"DEBUG: Files in .apkg: {z.namelist()}")
                 z.extractall(tmpdir)
 
-            db_path = os.path.join(tmpdir, "collection.anki2")
-            if not os.path.exists(db_path):
-                raise ValueError("No collection.anki2 found in apkg")
+            # Check what was extracted
+            extracted_files = os.listdir(tmpdir)
+            print(f"DEBUG: Extracted files: {extracted_files}")
 
+            # Look for the database file - could be collection.anki2 or collection.anki21b
+            db_path = None
+            for filename in ["collection.anki2", "collection.anki21b"]:
+                potential_path = os.path.join(tmpdir, filename)
+                if os.path.exists(potential_path):
+                    db_path = potential_path
+                    print(f"DEBUG: Found database at {filename}")
+                    break
+            
+            if not db_path:
+                raise ValueError(f"No Anki database found. Extracted files: {extracted_files}")
+
+            print(f"DEBUG: Database size: {os.path.getsize(db_path)} bytes")
+            
+            # Connect to the database
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
             
-            # DEBUG: Check what tables exist
+            # Check database structure
             cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
             tables = cur.fetchall()
-            print(f"DEBUG: Available tables: {tables}")
+            print(f"DEBUG: Available tables: {[t[0] for t in tables]}")
             
-            # DEBUG: Check notes table structure
+            # Check if we're dealing with a newer format
             cur.execute("PRAGMA table_info(notes)")
             columns = cur.fetchall()
-            print(f"DEBUG: Notes table columns: {columns}")
+            print(f"DEBUG: Notes table columns: {[col[1] for col in columns]}")
             
-            # DEBUG: Count total notes
+            # Count total notes
             cur.execute("SELECT COUNT(*) FROM notes")
             total_notes = cur.fetchone()[0]
             print(f"DEBUG: Total notes in database: {total_notes}")
             
-            # Get all notes with error handling
+            # Get a few sample notes to understand the structure
+            cur.execute("SELECT id, mid, flds FROM notes LIMIT 5")
+            sample_rows = cur.fetchall()
+            print("DEBUG: Sample notes:")
+            for note_id, model_id, flds in sample_rows:
+                fields = flds.split("\x1f") if flds else []
+                print(f"  Note {note_id} (model {model_id}): {len(fields)} fields")
+                for i, field in enumerate(fields[:3]):  # Show first 3 fields
+                    print(f"    Field {i}: '{field[:100]}{'...' if len(field) > 100 else ''}'")
+            
+            # Now get all notes
+            cur.execute("SELECT id, mid, flds FROM notes")
+            rows = cur.fetchall()
+            print(f"DEBUG: Retrieved {len(rows)} rows from notes table")
+            
+            # Also check what models/notetypes exist
             try:
-                cur.execute("SELECT id, flds FROM notes")
-                rows = cur.fetchall()
-                print(f"DEBUG: Successfully fetched {len(rows)} rows from SQL")
-            except Exception as e:
-                print(f"DEBUG: SQL query failed: {e}")
-                conn.close()
-                return pd.DataFrame(columns=["noteId", "Front", "Back"])
+                cur.execute("SELECT id, name FROM notetypes")
+                models = cur.fetchall()
+                print(f"DEBUG: Available models: {models}")
+            except:
+                # Fallback for older Anki versions
+                cur.execute("SELECT models FROM col")
+                models_json = cur.fetchone()[0]
+                print(f"DEBUG: Models JSON length: {len(models_json)} chars")
             
             conn.close()
 
+            # Process the notes
             data = []
-            for note_id, flds in rows:
-                fields = flds.split("\x1f")
-                front = fields[0] if len(fields) > 0 else ""
-                back = fields[1] if len(fields) > 1 else ""
-                print(f"DEBUG: Processing note {note_id}: Front='{front[:50]}...', Back='{back[:50]}...'")
+            for note_id, model_id, flds in rows:
+                fields = flds.split("\x1f") if flds else []
+                
+                # For cloze cards, the content is usually in the first field
+                # For basic cards, front=field[0], back=field[1]
+                if len(fields) == 1:
+                    # Likely a cloze card
+                    front = fields[0]
+                    back = ""
+                elif len(fields) >= 2:
+                    # Basic card or other format
+                    front = fields[0]
+                    back = fields[1]
+                else:
+                    front = ""
+                    back = ""
+                
+                print(f"DEBUG: Note {note_id}: Front='{front[:50]}...', Back='{back[:50]}...'")
                 data.append({"noteId": note_id, "Front": front, "Back": back})
 
-            print(f"DEBUG: Extracted {len(data)} notes total")
+            print(f"DEBUG: Successfully processed {len(data)} notes")
             return pd.DataFrame(data)
             
     except Exception as e:
-        print(f"DEBUG: Major error in load_apkg_to_df: {e}")
+        print(f"DEBUG: Exception in load_apkg_to_df: {e}")
         import traceback
         traceback.print_exc()
         return pd.DataFrame(columns=["noteId", "Front", "Back"])
-
-@app.route("/decksurf", methods=["GET", "POST"])
-def decksurf():
-    if request.method == "GET":
-        return render_template_string(DECKSURF_TEMPLATE)
-    
-    try:
-        # --- 1. Load deck ---
-        if "deck_file" not in request.files or request.files["deck_file"].filename == "":
-            return jsonify({"error": "No deck file uploaded"}), 400
-
-        deck_file = request.files["deck_file"]
-        deck_name = "Custom Deck"
-        deck_id = 1
-        
-        if deck_file.filename.endswith(".apkg"):
-            # Extract original deck name and ID for preservation
-            try:
-                original_name, original_id = extract_deck_metadata(deck_file)
-                deck_name = original_name
-                deck_id = original_id
-            except:
-                pass
-            # Reset file pointer after metadata extraction
-            deck_file.seek(0)
-            deck_df = load_apkg_to_df(deck_file)
-        elif deck_file.filename.endswith(".txt"):
-            deck_df = pd.read_csv(deck_file, sep="\t", engine="python", on_bad_lines="skip")
-        else:  # assume CSV
-            deck_df = pd.read_csv(deck_file, engine="python", on_bad_lines="skip")
-
-        if "noteId" not in deck_df.columns:
-            deck_df["noteId"] = range(len(deck_df))
-
-        required_cols = {"noteId", "Front", "Back"}
-        if not required_cols.issubset(deck_df.columns):
-            return jsonify({"error": "Deck must have noteId, Front, Back columns"}), 400
-
-        deck_cards = []
-        for _, row in deck_df.iterrows():
-            text = f"{row.get('Front','')} {row.get('Back','')}"
-            deck_cards.append({
-                "note_id": int(row["noteId"]),
-                "front": str(row.get("Front","")),
-                "back": str(row.get("Back","")),
-                "text": text
-            })
-
-        # --- 2. Parse objectives ---
-        los = []
-        if "los_file" in request.files and request.files["los_file"].filename:
-            f = request.files["los_file"]
-            fname = f.filename.lower()
-            if fname.endswith(".pdf"):
-                reader = PdfReader(f)
-                raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
-                los = [line.strip() for line in raw_text.split("\n") if 20 < len(line.strip()) < 250]
-            elif fname.endswith(".csv"):
-                df = pd.read_csv(f)
-                col = df.columns[0]
-                los = df[col].dropna().astype(str).tolist()
-            elif fname.endswith(".txt"):
-                los = [line.strip() for line in f.read().decode("utf-8").splitlines() if line.strip()]
-        elif "text" in request.form:
-            los = [line.strip() for line in request.form["text"].splitlines() if line.strip()]
-
-        if not los:
-            return jsonify({"error": "No learning objectives found"}), 400
-
-        # --- 3. Embeddings + matching ---
-        card_texts = [c["text"] for c in deck_cards]
-        card_embeddings = embed_model.encode(card_texts, normalize_embeddings=True)
-        alpha = float(request.form.get("alpha", 0.85))
-
-        results = []
-        matched_ids = set()
-
-        for lo in los:
-            lo_vec = embed_model.encode([lo], normalize_embeddings=True)[0]
-            emb_scores = card_embeddings @ lo_vec
-            fz_scores = np.array([
-                0.5 * fuzz.token_set_ratio(lo, c["text"]) / 100.0 +
-                0.3 * fuzz.partial_ratio(lo, c["text"]) / 100.0 +
-                0.2 * fuzz.token_sort_ratio(lo, c["text"]) / 100.0
-                for c in deck_cards
-            ])
-            combo_scores = alpha * emb_scores + (1 - alpha) * fz_scores
-            idxs = np.argsort(-combo_scores)[:3]
-
-            matches = []
-            note_ids = []
-            for i in idxs:
-                c = deck_cards[i]
-                matches.append({
-                    "note_id": c["note_id"],
-                    "preview": (c["front"][:100] + " ...") if len(c["front"]) > 100 else c["front"],
-                    "score": float(combo_scores[i])
-                })
-                note_ids.append(c["note_id"])
-                matched_ids.add(c["note_id"])
-
-            results.append({
-                "learning_objective": lo,
-                "matches": matches,
-                "search_query": " OR ".join([f"nid:{nid}" for nid in note_ids])
-            })
-
-        # --- 4. Export .apkg with only matched cards ---
-        mode = request.form.get("mode", "json")
-        if mode == "apkg":
-            cards = [(c["front"], c["back"]) for c in deck_cards if c["note_id"] in matched_ids]
-
-            # Use our genanki replacement function
-            deck_data = create_filtered_deck_genanki(deck_name, cards)
-
-            # Use original deck name for download
-            safe_name = "".join(c for c in deck_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
-            download_name = f"{safe_name}_filtered.apkg"
-
-            return send_file(
-                deck_data,
-                as_attachment=True,
-                download_name=download_name,
-                mimetype="application/octet-stream"
-            )
-
-        # --- Default: JSON for frontend ---
-        return jsonify({
-            "stats": {
-                "total_objectives": len(los), 
-                "deck_size": len(deck_cards),
-                "matched_cards": len(matched_ids),
-                "deck_name": deck_name
-            },
-            "results": results
-        })
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-
 @app.route('/')
 def home():
     return render_template_string('''
