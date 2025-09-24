@@ -9,7 +9,6 @@ import pandas as pd
 from PyPDF2 import PdfReader
 from rapidfuzz import fuzz
 from sentence_transformers import SentenceTransformer
-from anki_export import ApkgWriter
 import numpy as np
 from just_PDFs import generate_practice_test_return_text
 
@@ -46,6 +45,43 @@ def parse_cards(text):
             'is_cloze': is_cloze
         })
     return cards
+
+def create_filtered_deck_genanki(deck_name, cards):
+    """Create filtered deck using pure genanki (replaces ApkgWriter)"""
+    deck_id = int(hashlib.sha1(deck_name.encode('utf-8')).hexdigest()[:8], 16)
+    deck = genanki.Deck(deck_id, deck_name)
+    
+    # Basic model for cards
+    basic_model = genanki.Model(
+        1607392319,
+        'Basic Model',
+        fields=[
+            {'name': 'Front'},
+            {'name': 'Back'},
+        ],
+        templates=[
+            {
+                'name': 'Card 1',
+                'qfmt': '{{Front}}',
+                'afmt': '{{Front}}<br>{{Back}}',
+            },
+        ])
+    
+    # Add cards to deck
+    for front, back in cards:
+        note = genanki.Note(
+            model=basic_model,
+            fields=[front, back],
+            tags=['filtered']
+        )
+        deck.add_note(note)
+    
+    # Create package
+    package = genanki.Package(deck)
+    deck_data = io.BytesIO()
+    package.write_to_file(deck_data)
+    deck_data.seek(0)
+    return deck_data
 
 @app.route('/practice-tests', methods=['GET', 'POST'])
 def practice_tests():
@@ -260,9 +296,8 @@ def decksurf():
         if mode == "apkg":
             cards = [(c["front"], c["back"]) for c in deck_cards if c["note_id"] in matched_ids]
 
-            deck_data = io.BytesIO()
-            ApkgWriter(deck_name, cards).write_to_file(deck_data)
-            deck_data.seek(0)
+            # Use our genanki replacement function
+            deck_data = create_filtered_deck_genanki(deck_name, cards)
 
             # Use original deck name for download
             safe_name = "".join(c for c in deck_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
@@ -352,28 +387,28 @@ def home():
       </head>
       <body>
         <div class="container">
-          <h1>📚 Study Tools Hub</h1>
+          <h1>Study Tools Hub</h1>
           <p style="text-align: center; color: #666; margin-bottom: 40px;">
             Choose from our collection of study tools designed to help students succeed
           </p>
           
           <div class="tool-grid">
             <a href="/anki-generator" class="tool-card">
-              <div class="tool-title">🃏 Anki Deck Generator</div>
+              <div class="tool-title">Anki Deck Generator</div>
               <div class="tool-description">
                 Create custom Anki decks by pasting your cards. Supports both basic and cloze deletion formats.
               </div>
             </a>
             
             <a href="/decksurf" class="tool-card">
-              <div class="tool-title">🎯 DeckSurfer Mapper</div>
+              <div class="tool-title">DeckSurfer Mapper</div>
               <div class="tool-description">
                 Upload an Anki deck and learning objectives to find relevant cards and create filtered study decks.
               </div>
             </a>
             
             <a href="/practice-tests" class="tool-card">
-              <div class="tool-title">📝 Practice Test Generator</div>
+              <div class="tool-title">Practice Test Generator</div>
               <div class="tool-description">
                 Upload PDF lectures to automatically generate practice tests and study questions.
               </div>
@@ -582,18 +617,28 @@ DECKSURF_TEMPLATE = '''
       border-radius: 8px;
       margin-bottom: 20px;
     }
+    .back-link {
+      display: inline-block;
+      margin-bottom: 20px;
+      color: #007bff;
+      text-decoration: none;
+    }
+    .back-link:hover {
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
   <div class="container">
-    <h1>🎯 DeckSurfer - Smart Card Mapper</h1>
+    <a href="/" class="back-link">← Back to Hub</a>
+    <h1>DeckSurfer - Smart Card Mapper</h1>
     <p style="text-align: center; color: #666;">
       Upload your Anki deck and learning objectives to automatically find and extract relevant cards
     </p>
 
     <form id="decksurf-form" enctype="multipart/form-data">
       <div class="form-section">
-        <h3>📚 Upload Your Anki Deck</h3>
+        <h3>Upload Your Anki Deck</h3>
         <label>Select deck file (.apkg, .csv, .txt):</label>
         <input type="file" id="deck_file" name="deck_file" accept=".apkg,.csv,.txt" required>
         <small style="color: #6c757d;">
@@ -602,7 +647,7 @@ DECKSURF_TEMPLATE = '''
       </div>
 
       <div class="form-section">
-        <h3>🎯 Learning Objectives</h3>
+        <h3>Learning Objectives</h3>
         <label>Upload objectives file (PDF/CSV/TXT):</label>
         <input type="file" id="los_file" name="los_file" accept=".pdf,.csv,.txt">
         
@@ -614,7 +659,7 @@ DECKSURF_TEMPLATE = '''
       </div>
 
       <div class="form-section">
-        <h3>⚙️ Matching Settings</h3>
+        <h3>Matching Settings</h3>
         <label>Semantic vs Fuzzy Matching Balance:</label>
         <div class="slider-container">
           <span>Fuzzy</span>
@@ -629,14 +674,14 @@ DECKSURF_TEMPLATE = '''
       </div>
 
       <div class="button-group">
-        <button type="button" id="run-decksurf" class="btn-primary">🔍 Find Matching Cards</button>
-        <button type="button" id="download-deck" class="btn-success">💾 Download Filtered Deck</button>
+        <button type="button" id="run-decksurf" class="btn-primary">Find Matching Cards</button>
+        <button type="button" id="download-deck" class="btn-success">Download Filtered Deck</button>
       </div>
     </form>
 
     <div id="decksurf-results"></div>
     <button id="copy-queries-btn" class="btn-secondary" style="display:none;margin-top:10px;">
-      📋 Copy All Search Queries
+      Copy All Search Queries
     </button>
   </div>
 
@@ -668,7 +713,7 @@ DECKSURF_TEMPLATE = '''
       // Show loading state
       const btn = document.getElementById("download-deck");
       const originalText = btn.textContent;
-      btn.textContent = "⏳ Generating...";
+      btn.textContent = "Generating...";
       btn.disabled = true;
 
       try {
@@ -696,7 +741,7 @@ DECKSURF_TEMPLATE = '''
 
     // Show loading for results
     const resultsBox = document.getElementById("decksurf-results");
-    resultsBox.innerHTML = "<p style='text-align: center;'>🔍 Processing and matching cards... ⏳</p>";
+    resultsBox.innerHTML = "<p style='text-align: center;'>Processing and matching cards... ⏳</p>";
 
     try {
       const response = await fetch("/decksurf", { method: "POST", body: formData });
@@ -710,7 +755,7 @@ DECKSURF_TEMPLATE = '''
       // Build results
       let html = `
         <div class="stats-box">
-          <h3>📊 Matching Results</h3>
+          <h3>Matching Results</h3>
           <p><strong>Deck:</strong> ${data.stats.deck_name}</p>
           <p><strong>Total Cards:</strong> ${data.stats.deck_size} | <strong>Learning Objectives:</strong> ${data.stats.total_objectives} | <strong>Matched Cards:</strong> ${data.stats.matched_cards}</p>
         </div>
@@ -721,7 +766,7 @@ DECKSURF_TEMPLATE = '''
       data.results.forEach((res, idx) => {
         html += `
           <div class="match-result">
-            <h4>🎯 Objective ${idx+1}</h4>
+            <h4>Objective ${idx+1}</h4>
             <p><strong>"${res.learning_objective}"</strong></p>
             <div style="margin: 10px 0;">
               <strong>Top Matching Cards:</strong>
@@ -857,10 +902,10 @@ ANKI_GENERATOR_TEMPLATE = '''
 <body>
   <div class="container">
     <a href="/" class="back-link">← Back to Hub</a>
-    <h1>🃏 Anki Deck Generator</h1>
+    <h1>Anki Deck Generator</h1>
     
     <div class="help-section">
-      <h3>📖 How to Format Your Cards</h3>
+      <h3>How to Format Your Cards</h3>
       <p><strong>Basic Cards:</strong> Use a tab to separate front and back</p>
       <div class="example">What is the capital of France?	Paris</div>
       
@@ -878,7 +923,7 @@ ANKI_GENERATOR_TEMPLATE = '''
       <label for="cards_text">Your Cards (one per line):</label>
       <textarea id="cards_text" name="cards_text" placeholder="Enter your cards here, one per line..." required></textarea>
 
-      <button type="submit">📦 Generate Anki Deck</button>
+      <button type="submit">Generate Anki Deck</button>
     </form>
   </div>
 </body>
@@ -886,4 +931,5 @@ ANKI_GENERATOR_TEMPLATE = '''
 '''
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port, debug=True)
