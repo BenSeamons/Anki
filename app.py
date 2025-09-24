@@ -964,10 +964,10 @@ ANKI_GENERATOR_TEMPLATE = '''
       <div class="example">What is the capital of France?	Paris</div>
       
       <p><strong>Cloze Deletion:</strong> Use {{c1::answer}} format (no tab needed)</p>
-      <div class="example">The capital of France is {{c1::Paris}}</div>
+      <div class="example">{%raw%}The capital of France is {{c1::Paris}}{%endraw%}</div>
       
       <p><strong>Multiple Clozes:</strong> Use c1, c2, etc. for different deletions</p>
-      <div class="example">{{c1::Napoleon}} was born in {{c2::1769}} in {{c3::Corsica}}</div>
+      <div class="example">{%raw%}{{c1::Napoleon}} was born in {{c2::1769}} in {{c3::Corsica}}{%endraw%}</div>
     </div>
 
     <form method="POST">
