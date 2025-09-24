@@ -201,6 +201,10 @@ def load_apkg_to_df(apkg_file):
         
         # DEBUG: Check what tables exist
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        print(f"DEBUG: Raw SQL returned {len(rows)} rows")
+        for i, (note_id, flds) in enumerate(rows):
+            if i < 10:  # Show first 10
+                print(f"DEBUG: Raw row {i}: id={note_id}, flds='{flds[:100]}...'")
         tables = cur.fetchall()
         print(f"DEBUG: Available tables: {tables}")
         
