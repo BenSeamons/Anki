@@ -83,8 +83,66 @@ def create_filtered_deck_genanki(deck_name, cards):
     deck_data.seek(0)
     return deck_data
 
+def extract_deck_metadata(apkg_file):
+    """Extract deck name and ID from .apkg file"""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        apkg_path = os.path.join(tmpdir, apkg_file.filename)
+        apkg_file.save(apkg_path)
+
+        with zipfile.ZipFile(apkg_path, "r") as z:
+            z.extractall(tmpdir)
+
+        db_path = os.path.join(tmpdir, "collection.anki2")
+        if not os.path.exists(db_path):
+            raise ValueError("No collection.anki2 found in apkg")
+
+        conn = sqlite3.connect(db_path)
+        cur = conn.cursor()
+        
+        # Get deck info
+        cur.execute("SELECT decks FROM col")
+        decks_json = cur.fetchone()[0]
+        conn.close()
+        
+        import json
+        decks = json.loads(decks_json)
+        
+        # Find the main deck (not default)
+        for deck_id, deck_info in decks.items():
+            if deck_info['name'] != 'Default':
+                return deck_info['name'], int(deck_id)
+        
+        # Fallback
+        return "Imported Deck", 1
+
 @app.route('/practice-tests', methods=['GET', 'POST'])
 def practice_tests():
+    if request.method == 'GET':
+        return render_template_string('''
+        <html>
+        <head>
+            <title>Practice Test Generator</title>
+            <style>
+                body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+                .container { max-width: 800px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                .back-link { display: inline-block; margin-bottom: 20px; color: #007bff; text-decoration: none; }
+                button { background-color: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; margin-top: 20px; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <a href="/" class="back-link">← Back to Hub</a>
+                <h1>Practice Test Generator</h1>
+                <form method="POST" enctype="multipart/form-data">
+                    <p><strong>Note:</strong> Processing can take up to 10 minutes.</p>
+                    <label>Upload PDF files:</label><br>
+                    <input type="file" name="individual_pdfs" multiple accept="application/pdf"><br><br>
+                    <button type="submit">Generate Practice Tests</button>
+                </form>
+            </div>
+        </body>
+        </html>
+        ''')
     if request.method == 'POST':
        # Get files from both inputs
         folder_files = request.files.getlist('folder_pdfs')
