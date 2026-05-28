@@ -1,0 +1,22 @@
+# Secrets - never commit these
+.env
+token.json
+Credentials.json
+medtools-77dfb-firebase-adminsdk-fbsvc-565e4406ea.json
+*-firebase-adminsdk-*.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Logs / local data
+logs.json
+logs2.json
+logs3.json
+
+# Build artifacts
+dist/
+build/

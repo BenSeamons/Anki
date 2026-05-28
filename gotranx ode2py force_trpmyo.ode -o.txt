@@ -1,0 +1,16 @@
+gotranx ode2py force_trpmyo.ode -o force_trpmyo_module.py
+
+calculateFNai — sodium concentration ODE, uses multiple current terms
+
+calculateFCai — cytosolic calcium, summation of several influx/efflux terms
+
+calculateFCaJSR / FCaNSR — SR calcium compartments
+
+calculateFJup / calculateFJrel — pump/release fluxes, algebraically defined
+
+calculateFRyR — ryanodine receptor behavior, often stiff
+calculateF_trpmyo (you're already doing!)
+
+calculateFHTRPNCa, calculateFLTRPNCa — buffering ODEs
+
+calculateFATP, calculateATPm — mito ATP dynamics

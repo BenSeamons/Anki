@@ -1,0 +1,13 @@
+Your active configuration is: [cloudshell-20664]
+cloudArmorTier: CA_STANDARD
+commonInstanceMetadata:
+  fingerprint: 08A1MYsCmWM=
+  items:
+  - key: google-compute-default-zone
+    value: us-central1-b
+  - key: google-compute-default-region
+    value: us-central1
+  - key: ssh-keys
+    value: student-04-cf50350e96cc:ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDetBbusVxo5V/7jF02B51PXLOPjCwgscs6+IAHeCkavVyOLM+0W/iyegImisaBkeRvLFdKWfh0Jx6SpEk6AbtEZz+BkwvbmXPCcpmP57kqLS7NFxMw76bDfxTMPGlYii6zeZlm5te6aXCuqFzyl29HR2G2M0/B26lKrOHGn3+X/iGtzJn0Sj5a8cCC1jzTVvBClsFWTy1QPLK9FLf1AjwTKmQqz/fhN0CCgH6hh353OunyiO2Ml6ExO0RRIBF8EjeGm2wQBuWL10vjrH55Jgr769H3jY3Q0ThhIVG6M3KFzTuefr2BtdNLr2COCNrOOFGvko2sJUfN7pzAdPIb1A+j
+      student-04-cf50350e96cc@qwiklabs.net
+  - key: enable-oslogin

@@ -1,0 +1,6 @@
+flask
+genanki
+anthropic
+gunicorn
+python-dotenv
+firebase-admin
