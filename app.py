@@ -59,7 +59,7 @@ def add_cors_headers(response):
 claude = anthropic.Anthropic()
 
 PRACTICE_TEST_PROMPT = (
-    "Based on this document, generate 25 NBME Style multiple-choice questions with 4 options each. "
+    "Based on this document, generate 15 NBME Style multiple-choice questions with 4 options each. "
     "Focus on any learning objectives listed in the lecture and content relevant to Step 1 boards.\n\n"
     "STRICT OUTPUT FORMAT:\n"
     "Output ONLY a raw JSON array of objects. Do not include markdown formatting like ```json.\n"
@@ -133,11 +133,11 @@ def save_to_library(title, item_type, data, explicit_uid=None):
         print(f"Error saving to library: {e}", file=sys.stderr)
         sys.stderr.flush()
 
-def call_claude_with_pdf(pdf_path, prompt, max_tokens=4096):
+def call_claude_with_pdf(pdf_path, prompt, max_tokens=4096, model="claude-sonnet-4-6"):
     with open(pdf_path, 'rb') as f:
         pdf_data = base64.standard_b64encode(f.read()).decode('utf-8')
     response = claude.messages.create(
-        model="claude-sonnet-4-6",
+        model=model,
         max_tokens=max_tokens,
         messages=[{
             "role": "user",
@@ -1231,7 +1231,7 @@ def practice_tests_get():
       <div class="section-header">
         <span class="pill pill-green">📝 Practice Tests</span>
         <div class="section-title">NBME-Style Practice Tests</div>
-        <div class="section-sub">Upload one or more lecture PDFs and get 25 board-style questions with a full answer key for each.</div>
+        <div class="section-sub">Upload one or more lecture PDFs and get 15 board-style questions with a full answer key for each.</div>
       </div>
 
       <div class="panel">
@@ -1334,7 +1334,7 @@ def practice_tests_get():
             const { done, value } = await reader.read();
             if (done) break;
             buf += dec.decode(value, { stream: true });
-            const lines = buf.split('\n');
+            const lines = buf.split('\\n');
             buf = lines.pop();
 
             for (const line of lines) {
@@ -1342,7 +1342,17 @@ def practice_tests_get():
               let evt;
               try { evt = JSON.parse(line.slice(6)); } catch(e) { continue; }
 
-              if (evt.type === 'test') {
+              if (evt.type === 'test' && evt.error) {
+                console.error('Practice test error for', evt.filename, ':', evt.error);
+                const pidx = fileList.indexOf(evt.filename);
+                const pending = pidx >= 0 ? document.getElementById('pending-' + pidx) : null;
+                const errDiv = document.createElement('div');
+                errDiv.className = 'result-block';
+                errDiv.innerHTML = `<div style="padding:20px;color:#ef4444">❌ Failed to generate questions for <strong>${evt.filename}</strong><br><small style="opacity:0.7">${evt.error}</small></div>`;
+                if (pending) pending.replaceWith(errDiv);
+                else resultsArea.appendChild(errDiv);
+                completedCount++;
+              } else if (evt.type === 'test') {
                 const rid = 'r' + completedCount++;
                 const pidx = fileList.indexOf(evt.filename);
                 const pending = pidx >= 0 ? document.getElementById('pending-' + pidx) : null;
@@ -1424,7 +1434,6 @@ def _practice_test_js():
       .pdf-only { display: none; }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
     <script>
       function renderPracticeTests() {
         document.querySelectorAll('.result-block').forEach((block) => {
@@ -1520,60 +1529,48 @@ def _practice_test_js():
         document.getElementById(`exp-${testId}-${qIndex}`).style.display = 'block';
       }
       
-      const pdfOpts = name => ({
-        margin: [15, 20],
-        filename: name.replace('.pdf','') + '_practice_test.pdf',
-        image: { type: 'jpeg', quality: 0.98 },
-        html2canvas: { scale: 2, backgroundColor: '#ffffff' },
-        jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
-        pagebreak: { mode: ['avoid-all', 'css'] }
-      });
-
       function downloadPdf(idx, fname) {
-        const el = document.getElementById('content-' + idx);
-        const clone = el.cloneNode(true);
-        clone.id = 'pdf-clone-' + idx;
-        clone.className = '';
-        clone.style.cssText = 'position:absolute;left:-9999px;top:-9999px;background:#fff;color:#111;padding:20px;font-family:Georgia,serif;font-size:14px;line-height:1.7;max-height:none;overflow:visible;width:800px;z-index:-1000;';
-        clone.style.display = 'block';
-        
-        // Override CSS variables specifically for the PDF render
-        clone.style.setProperty('--text', '#111', 'important');
-        clone.style.setProperty('--text-muted', '#333', 'important');
-        clone.style.setProperty('--green', '#000', 'important');
-        clone.style.setProperty('--orange', '#000', 'important');
-        clone.style.setProperty('--border', '#ccc', 'important');
-        clone.style.setProperty('--surface', '#fff', 'important');
-        
-        // Ensure pdf-only blocks are visible inside the clone
-        clone.querySelectorAll('.pdf-only').forEach(c => {
-          c.style.display = 'block';
+        const block = document.getElementById('result-' + idx);
+        if (!block) { alert('Test not found.'); return; }
+
+        // Rebuild questions from the live interactive DOM — no CSS variable issues
+        const cards = block.querySelectorAll('.drill-card');
+        if (!cards.length) { alert('No questions to export.'); return; }
+
+        let html = '';
+        cards.forEach((card, i) => {
+          const qText = card.querySelector('.drill-q') ? card.querySelector('.drill-q').textContent : '';
+          const choices = Array.from(card.querySelectorAll('.drill-choice')).map(b => {
+            const letter = b.textContent.charAt(0);
+            const isCorrect = b.classList.contains('correct');
+            return `<li style="${isCorrect ? 'font-weight:bold' : ''}">${b.textContent}</li>`;
+          });
+          const exp = card.querySelector('.drill-exp') ? card.querySelector('.drill-exp').innerHTML : '';
+          html += `
+            <div style="margin-bottom:28px;page-break-inside:avoid">
+              <p style="font-weight:600;font-size:15px;margin:0 0 10px">${qText}</p>
+              <ul style="margin:0 0 10px;padding-left:20px;list-style:none">${choices.join('')}</ul>
+              <div style="background:#f0f0f0;padding:10px 14px;border-left:4px solid #333;font-size:13px;border-radius:4px">
+                <strong>Explanation:</strong> ${exp}
+              </div>
+            </div>`;
         });
-        
-        clone.querySelectorAll('*').forEach(c => {
-          c.style.maxHeight = 'none';
-          c.style.overflow = 'visible';
-          // Force all text to be dark as an extra fallback
-          c.style.setProperty('color', '#111', 'important');
-          c.style.textShadow = 'none';
-        });
-        clone.querySelectorAll('table').forEach(t => t.style.cssText = 'border-collapse:collapse;width:100%;margin:10px 0');
-        clone.querySelectorAll('th,td').forEach(c => c.style.cssText = 'border:1px solid #ccc;padding:6px 10px;color:#111');
-        clone.querySelectorAll('th').forEach(c => c.style.background = '#f0f0f0');
-        
-        // Remove background colors that might conflict with white
-        clone.querySelectorAll('code').forEach(c => {
-            c.style.background = '#f5f5f5';
-            c.style.borderColor = '#ddd';
-        });
-        
-        // Append to DOM so html2canvas computes styles perfectly
-        document.body.appendChild(clone);
-        
-        html2pdf().set(pdfOpts(fname)).from(clone).save().then(() => {
-            // Clean up the DOM after PDF is generated
-            document.body.removeChild(clone);
-        });
+
+        const title = fname.replace(/\\.pdf$/i, '');
+        const win = window.open('', '_blank');
+        win.document.write(`<!DOCTYPE html><html><head>
+          <title>${title} — Practice Test</title>
+          <style>
+            body { font-family: Georgia, serif; font-size: 14px; line-height: 1.7; color: #111; max-width: 750px; margin: 40px auto; padding: 0 20px; }
+            h1 { font-size: 20px; border-bottom: 2px solid #333; padding-bottom: 8px; margin-bottom: 24px; }
+            @media print { body { margin: 20px; } }
+          </style>
+        </head><body>
+          <h1>${title} — Practice Test</h1>
+          ${html}
+          <script>setTimeout(() => window.print(), 400);<\\/script>
+        </body></html>`);
+        win.document.close();
       }
       
       document.addEventListener('DOMContentLoaded', renderPracticeTests);
@@ -1657,7 +1654,7 @@ def practice_tests_post():
         def process_path(item):
             fname, path = item
             try:
-                raw_text = call_claude_with_pdf(path, PRACTICE_TEST_PROMPT)
+                raw_text = call_claude_with_pdf(path, PRACTICE_TEST_PROMPT, max_tokens=8096, model="claude-haiku-4-5")
                 text = raw_text.strip()
                 import re as _re
                 if text.startswith("```"):
@@ -1787,16 +1784,20 @@ def practice_tests_stream():
         all_results = []
         try:
             def process_one(item):
+                import sys
                 fname, path = item
                 try:
-                    raw = call_claude_with_pdf(path, PRACTICE_TEST_PROMPT)
+                    raw = call_claude_with_pdf(path, PRACTICE_TEST_PROMPT, max_tokens=8096, model="claude-haiku-4-5")
                     text = raw.strip()
+                    print(f"DEBUG stream raw response ({fname}): {repr(text[:300])}", file=sys.stderr)
                     if text.startswith("```"):
                         text = _re_s.sub(r'^```[^\n]*\n?', '', text)
                         text = _re_s.sub(r'\n?```$', '', text.strip())
                     json.loads(text)  # validate
+                    print(f"DEBUG stream success ({fname}): {len(text)} chars", file=sys.stderr)
                     return fname, text, None
                 except Exception as e:
+                    print(f"DEBUG stream ERROR ({fname}): {e}", file=sys.stderr)
                     return fname, '[]', str(e)
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
