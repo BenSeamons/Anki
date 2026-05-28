@@ -17,6 +17,13 @@ logs.json
 logs2.json
 logs3.json
 
+# Generated practice test PDFs
+*_practice_test.pdf
+*_PracticeTest.pdf
+
+# Duplicate READMEs
+README (*).md
+
 # Build artifacts
 dist/
 build/
