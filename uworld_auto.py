@@ -359,221 +359,166 @@ async def scrape_uworld(email, password, headless=False, debug=False):
 
         print(f"  ✅ Logged in! (landed at: {page.url})")
 
-        # ── LAUNCH THE QBANK ─────────────────────────────────────────────
-        # Don't rely on clicking the UI button — it has an overlay issue.
-        # Instead, extract the direct qbank URL from the API responses
-        # we've already captured (getDashboardAndCartUrls / GetAllSubscriptions).
-        print("\n  🚀 Finding QBank URL from API data...")
-        await asyncio.sleep(2)
+        # ── FIND SUBSCRIPTION ID AND NAVIGATE TO QBANK ──────────────────
+        # Now we know the exact URL structure:
+        #   https://apps.uworld.com/courseapp/usmle/v53/en-US/performance/reports/{sub_id}
+        #   https://apps.uworld.com/courseapp/usmle/v53/en-US/previoustests/{sub_id}
+        # We just need to find the right sub_id for the Step 2 CK QBank.
 
+        print("\n  🚀 Identifying QBank subscription ID...")
+        await asyncio.sleep(2)
         if debug:
             await page.screenshot(path="debug_04_subscriptions.png")
 
-        qbank_url = None
+        # Collect all subscription IDs from the payment API URLs
+        sub_ids_seen = []
+        for url in intercepted:
+            m2 = re.search(r'GetPaymentsForSubscription/(\d+)', url)
+            if m2:
+                sub_ids_seen.append(m2.group(1))
 
-        # 1. Try getDashboardAndCartUrls — most direct source
+        print(f"    Subscription IDs from account page: {sub_ids_seen}")
+
+        # Parse GetAllSubscriptions to find the medical/Step 2 one
+        print(f"    GetAllSubscriptions → ", end="")
+        medical_sub_id = None
         for url, data in intercepted.items():
-            if "getDashboardAndCartUrls" in url or "getDashboard" in url.lower():
-                # Always print this — it's small and critical for debugging
-                print(f"    getDashboardAndCartUrls → {json.dumps(data)[:400]}")
-                if isinstance(data, dict):
-                    # Walk all string values looking for an apps.uworld.com URL
-                    def find_url(obj, depth=0):
-                        if depth > 5: return None
-                        if isinstance(obj, str) and "apps.uworld.com" in obj:
-                            return obj
-                        if isinstance(obj, dict):
-                            for v in obj.values():
-                                r = find_url(v, depth+1)
-                                if r: return r
-                        if isinstance(obj, list):
-                            for v in obj:
-                                r = find_url(v, depth+1)
-                                if r: return r
-                        return None
-                    qbank_url = find_url(data)
+            if "GetAllSubscriptions" in url:
+                print(json.dumps(data)[:1000])  # full print for debugging
+                def _find_sub(obj, depth=0):
+                    if depth > 6: return None
+                    if isinstance(obj, dict):
+                        # Check if this dict looks like a subscription with a medical product
+                        name = " ".join(str(v) for v in obj.values() if isinstance(v, str)).lower()
+                        is_medical = any(k in name for k in ["step 2","step2","usmle","ck qbank","step2ck"])
+                        if is_medical:
+                            for idf in ["subscriptionId","id","courseSubscriptionId","subId","courseId"]:
+                                if obj.get(idf):
+                                    return str(obj[idf])
+                        for v in obj.values():
+                            r = _find_sub(v, depth+1)
+                            if r: return r
+                    elif isinstance(obj, list):
+                        for v in obj:
+                            r = _find_sub(v, depth+1)
+                            if r: return r
+                    return None
+                medical_sub_id = _find_sub(data)
+                break
+        else:
+            print("(not captured)")
 
-        # 2. Fall back: construct URL from subscription ID
-        #    Subscription IDs appear in GetPaymentsForSubscription URLs
-        if not qbank_url:
-            sub_ids = []
-            for url in intercepted:
-                m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
-                if m:
-                    sub_ids.append(m.group(1))
-            # Also look inside GetAllSubscriptions response
-            for url, data in intercepted.items():
-                if "GetAllSubscriptions" in url:
-                    # Always print — small and critical
-                    print(f"    GetAllSubscriptions → {json.dumps(data)[:600]}")
-                    def find_medical_sub_id(obj, depth=0):
-                        if depth > 5: return None
-                        if isinstance(obj, dict):
-                            name = str(obj.get("productName","") or obj.get("courseName","")
-                                       or obj.get("name","") or obj.get("title","")).lower()
-                            if any(k in name for k in ["step","usmle","medical","qbank"]):
-                                sid = obj.get("id") or obj.get("subscriptionId") or obj.get("courseId")
-                                if sid:
-                                    return str(sid)
-                            for v in obj.values():
-                                r = find_medical_sub_id(v, depth+1)
-                                if r: return r
-                        if isinstance(obj, list):
-                            for v in obj:
-                                r = find_medical_sub_id(v, depth+1)
-                                if r: return r
-                        return None
-                    sid = find_medical_sub_id(data)
-                    if sid:
-                        sub_ids.insert(0, sid)
+        if medical_sub_id:
+            print(f"    Found medical sub ID from GetAllSubscriptions: {medical_sub_id}")
+        else:
+            # Try each sub ID — open a throwaway page and see which one loads the qbank
+            print(f"    Probing each subscription ID to find the qbank...")
+            APP = "https://apps.uworld.com/courseapp/usmle/v53/en-US"
+            for sid in sub_ids_seen:
+                probe_url = f"{APP}/performance/reports/{sid}"
+                try:
+                    probe = await context.new_page()
+                    probe.on("response", on_response)
+                    await probe.goto(probe_url, wait_until="domcontentloaded", timeout=12000)
+                    landed = probe.url
+                    await probe.close()
+                    if "apps.uworld.com" in landed and "login" not in landed.lower():
+                        medical_sub_id = sid
+                        print(f"    ✅ Subscription {sid} loads the qbank")
+                        break
+                    print(f"    ✗  {sid} → {landed[:60]}")
+                except Exception as e:
+                    try: await probe.close()
+                    except: pass
+                    print(f"    ✗  {sid} → error: {e}")
 
-            if sub_ids:
-                # Use the largest ID (most recent subscription)
-                best_id = sorted(sub_ids)[-1]
-                qbank_url = f"https://apps.uworld.com/courseapp/usmle/v53/en-US/dashboard/{best_id}"
-                print(f"    Constructed qbank URL from subscription ID {best_id}")
-
-        # 3. Try clicking the Launch button and capturing the new tab
-        if not qbank_url:
-            print("    Trying Launch button click...")
-            try:
-                # Use expect_page to capture the new tab the moment it opens
-                async with context.expect_page(timeout=8000) as new_page_info:
-                    # JS click bypasses any overlay
-                    clicked = await page.evaluate("""
-                        () => {
-                            const all = [...document.querySelectorAll('button, a')];
-                            // Prefer button near Step/Medical/QBank text
-                            const medical = all.find(el => {
-                                if (!/launch/i.test(el.textContent)) return false;
-                                const row = el.closest('tr,li,div');
-                                return row && /step|medical|usmle|qbank|ck/i.test(row.textContent);
-                            });
-                            const btn = medical || all.find(el => /launch/i.test(el.textContent));
-                            if (btn) { btn.click(); return btn.textContent.trim() || '(clicked)'; }
-                            return null;
-                        }
-                    """)
-                    print(f"    JS clicked: {clicked}")
-                new_page = await new_page_info.value
-                await new_page.wait_for_load_state("networkidle", timeout=25000)
-                qbank_url = new_page.url
-                page = new_page
-                page.on("response", on_response)
-                print(f"    New tab: {qbank_url}")
-            except Exception as e:
-                print(f"    expect_page timed out ({e}) — checking if current page navigated")
-                await asyncio.sleep(3)
-                if "apps.uworld.com" in page.url:
-                    qbank_url = page.url
-
-        if not qbank_url:
+        if not medical_sub_id:
             raise RuntimeError(
-                "Could not find the QBank URL. Run with --debug to inspect API responses."
+                "Could not identify the Step 2 QBank subscription ID.\n"
+                "Paste the full output above to Ben/Claude for analysis."
             )
 
-        print(f"    QBank URL: {qbank_url}")
+        APP_BASE = "https://apps.uworld.com/courseapp/usmle/v53/en-US"
+        print(f"  ✅ Using subscription ID: {medical_sub_id}")
 
-        # Navigate to the qbank (may open in a new tab context)
-        if page.url != qbank_url:
-            # Open in the current page (cookies carry over since same browser context)
-            new_page = await context.new_page()
-            new_page.on("response", on_response)
-            await new_page.goto(qbank_url, wait_until="networkidle", timeout=25000)
-            page = new_page
+        # Open a dedicated page for the qbank (cookies carry over in the same context)
+        qb_page = await context.new_page()
+        qb_page.on("response", on_response)
 
+        # ── PERFORMANCE REPORTS: Subjects → Systems → Topics ─────────────
+        print("\n  📊 Loading performance reports (Subjects / Systems / Topics)...")
+
+        perf_url = f"{APP_BASE}/performance/reports/{medical_sub_id}"
+        await qb_page.goto(perf_url, wait_until="networkidle", timeout=25000)
         await asyncio.sleep(3)
+
         if debug:
-            await page.screenshot(path="debug_05_qbank.png")
-            print(f"    Inside qbank at: {page.url}")
+            await qb_page.screenshot(path="debug_05_perf_subjects.png")
+        print(f"    Loaded: {qb_page.url}")
 
-        # ── NAVIGATE TO PERFORMANCE ANALYTICS ───────────────────────────
-        print("\n  📊 Loading performance analytics...")
-
-        # The qbank app uses real path navigation, not hashes.
-        # Base is everything up to the last path segment.
-        # e.g. https://apps.uworld.com/courseapp/usmle/v53/en-US/dashboard/15778134
-        # → app_root = https://apps.uworld.com/courseapp/usmle/v53/en-US/
-        raw_base = page.url.split("#")[0].split("?")[0]
-        import re as _re2
-        m = _re2.match(r'(https://[^/]+(?:/[^/]+){1,5}/)', raw_base)
-        app_root = m.group(1) if m else raw_base.rsplit("/", 1)[0] + "/"
-        print(f"    App root: {app_root}")
-
-        # Try path-based performance URLs first, then nav clicks
-        perf_paths = [
-            "analytics", "performance", "stats",
-            "qbank/analytics", "qbank/performance",
-            "reports", "summary",
-        ]
-        for path in perf_paths:
-            target = app_root + path
-            try:
-                await page.goto(target, wait_until="networkidle", timeout=12000)
+        # Click Systems tab
+        try:
+            systems_tab = qb_page.get_by_role("tab", name=re.compile("systems", re.I))
+            if await systems_tab.count() == 0:
+                systems_tab = qb_page.locator('button:has-text("Systems"), [role="tab"]:has-text("Systems")')
+            if await systems_tab.count() > 0:
+                await systems_tab.first.click()
                 await asyncio.sleep(3)
-                cur = page.url
+                print("    ✅ Clicked Systems tab")
                 if debug:
-                    await page.screenshot(path=f"debug_perf_{path.replace('/','_')}.png")
-                    print(f"    Tried {target} → {cur}")
-                # Success = didn't get kicked back to login or dashboard unchanged
-                if "login" not in cur.lower() and cur != raw_base:
-                    print(f"    Performance page: {cur}")
-                    break
-            except Exception as e:
+                    await qb_page.screenshot(path="debug_06_perf_systems.png")
+        except Exception as e:
+            print(f"    Systems tab: {e}")
+
+        # Click Topics tab
+        try:
+            topics_tab = qb_page.get_by_role("tab", name=re.compile("topics", re.I))
+            if await topics_tab.count() == 0:
+                topics_tab = qb_page.locator('button:has-text("Topics"), [role="tab"]:has-text("Topics")')
+            if await topics_tab.count() > 0:
+                await topics_tab.first.click()
+                await asyncio.sleep(3)
+                print("    ✅ Clicked Topics tab")
                 if debug:
-                    print(f"    {target} failed: {e}")
-                continue
+                    await qb_page.screenshot(path="debug_07_perf_topics.png")
+        except Exception as e:
+            print(f"    Topics tab: {e}")
 
-        # Also try clicking nav links by visible label
-        for label in ["Analytics", "Performance", "My Performance", "Stats", "Reports"]:
-            try:
-                link = page.get_by_role("link", name=label)
-                if await link.count() > 0:
-                    await link.first.click()
-                    await asyncio.sleep(4)
-                    print(f"    Clicked nav link '{label}': {page.url}")
-                    break
-            except Exception:
-                continue
+        # ── PREVIOUS TESTS (for incorrect question block info) ────────────
+        print("\n  ❌ Loading previous tests / incorrect questions...")
 
-        # ── NAVIGATE TO INCORRECT QUESTIONS ─────────────────────────────
-        print("\n  ❌ Loading incorrect questions list...")
+        prev_url = f"{APP_BASE}/previoustests/{medical_sub_id}"
+        await qb_page.goto(prev_url, wait_until="networkidle", timeout=25000)
+        await asyncio.sleep(4)
+        print(f"    Loaded: {qb_page.url}")
 
-        # Try qbank page with incorrect filter
-        raw_base2 = page.url.split("#")[0].split("?")[0]
-        m2 = _re2.match(r'(https://[^/]+(?:/[^/]+){1,5}/)', raw_base2)
-        app_root2 = m2.group(1) if m2 else raw_base2.rsplit("/", 1)[0] + "/"
+        if debug:
+            await qb_page.screenshot(path="debug_08_previoustests.png")
 
-        qbank_paths = [
-            "qbank?filter=incorrect",
-            "qbank?status=incorrect",
-            "qbank",
-        ]
-        for path in qbank_paths:
-            target = app_root2 + path
-            try:
-                await page.goto(target, wait_until="networkidle", timeout=12000)
-                await asyncio.sleep(4)
-                if "login" not in page.url.lower():
-                    print(f"    QBank page: {page.url}")
-                    break
-            except Exception:
-                continue
+        # Also try the Step 2 Review tab (as opposed to Shelf Review)
+        try:
+            step2_tab = qb_page.get_by_role("tab", name=re.compile("step 2", re.I))
+            if await step2_tab.count() == 0:
+                step2_tab = qb_page.locator('[role="tab"]:has-text("Step 2"), button:has-text("Step 2")')
+            if await step2_tab.count() > 0:
+                await step2_tab.first.click()
+                await asyncio.sleep(3)
+                print("    ✅ Clicked Step 2 Review tab")
+        except Exception:
+            pass
 
-        # Try clicking an "Incorrect" filter chip/button on the page
-        for sel in ['button:has-text("Incorrect")', 'label:has-text("Incorrect")',
-                    '[data-testid*="incorrect" i]', 'span:has-text("Incorrect")']:
-            try:
-                el = page.locator(sel).first
-                if await el.count() > 0:
-                    await el.click()
-                    await asyncio.sleep(3)
-                    break
-            except Exception:
-                continue
+        # Try navigating to QBank create-test page with incorrect filter
+        qbank_url_try = f"{APP_BASE}/qbank/{medical_sub_id}"
+        try:
+            await qb_page.goto(qbank_url_try, wait_until="networkidle", timeout=12000)
+            await asyncio.sleep(3)
+            print(f"    QBank page: {qb_page.url}")
+        except Exception:
+            pass
 
-        # Give the API calls time to finish loading all data
-        await asyncio.sleep(6)
+        # Give everything time to settle and fire remaining API calls
+        await asyncio.sleep(5)
+        page = qb_page  # update reference for final screenshot
 
         if debug:
             await page.screenshot(path="debug_final.png")
