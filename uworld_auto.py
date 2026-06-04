@@ -357,39 +357,93 @@ async def scrape_uworld(email, password, headless=False, debug=False):
                 "If you have 2FA enabled, run without --headless and complete it manually."
             )
 
-        print(f"  ✅ Logged in! (route: {current_hash})")
+        print(f"  ✅ Logged in! (landed at: {page.url})")
+
+        # ── LAUNCH THE QBANK ─────────────────────────────────────────────
+        # After login UWorld shows a subscriptions page with a "Launch" button
+        # per product. We need to click Launch on the medical/Step qbank.
+        # It may open in a new tab, so we watch for that.
+        print("\n  🚀 Launching the QBank...")
+
+        # Wait briefly for the subscriptions page to settle
+        await asyncio.sleep(2)
+        if debug:
+            await page.screenshot(path="debug_04_subscriptions.png")
+
+        # Find the Launch button closest to a medical/Step label.
+        # Strategy: look for a row that contains "Step" or "Medical" or "USMLE"
+        # and click the Launch button inside it.
+        launched = await page.evaluate("""
+            () => {
+                // Find all Launch buttons
+                const buttons = [...document.querySelectorAll('button, a')]
+                    .filter(el => /^launch$/i.test(el.textContent.trim()));
+
+                if (buttons.length === 0) return 'no_buttons';
+
+                // Prefer a button near text mentioning Step/Medical/USMLE/QBank
+                const medical = buttons.find(btn => {
+                    const section = btn.closest('tr, li, div[class*="row"], div[class*="card"], div[class*="product"]');
+                    const text = section ? section.textContent : '';
+                    return /step|medical|usmle|qbank/i.test(text);
+                });
+
+                const target = medical || buttons[0];
+                target.click();
+                return target.textContent.trim();
+            }
+        """)
+        print(f"    Clicked: {launched}")
+
+        if launched == 'no_buttons':
+            # Already inside the qbank — no subscriptions page appeared
+            print("    No Launch button found — may already be inside the qbank")
+        else:
+            # The Launch button may open a new tab. Wait for it.
+            await asyncio.sleep(2)
+            pages = context.pages
+            if len(pages) > 1:
+                # Switch to the newest tab
+                page = pages[-1]
+                await page.bring_to_front()
+                # Re-attach the response interceptor to the new page
+                page.on("response", on_response)
+                print(f"    New tab opened: {page.url}")
+                await page.wait_for_load_state("networkidle", timeout=20000)
+            else:
+                await page.wait_for_load_state("networkidle", timeout=20000)
+
+            await asyncio.sleep(3)
+            if debug:
+                await page.screenshot(path="debug_05_qbank_launched.png")
+                print(f"    QBank URL: {page.url}")
 
         # ── NAVIGATE TO PERFORMANCE ──────────────────────────────────────
         print("\n  📊 Loading performance analytics...")
 
-        # UWorld SPA hash routes — try each until one loads data
-        perf_hashes = [
-            "#/analytics/",
-            "#/performance/",
-            "#/qbank/analytics/",
-            "#/qbank/performance/",
-            "#/dashboard/",
-        ]
+        base = page.url.split("#")[0].split("?")[0]  # e.g. https://medical.uworld.com/app/...
+
+        # Try hash routes first, then click nav links
+        perf_hashes = ["#/analytics/", "#/performance/", "#/qbank/analytics/",
+                       "#/qbank/performance/", "#/dashboard/"]
 
         for hash_route in perf_hashes:
-            target = f"https://www.uworld.com/app/index.html{hash_route}"
             try:
-                await page.goto(target, wait_until="networkidle", timeout=12000)
+                await page.goto(base + hash_route, wait_until="networkidle", timeout=12000)
                 await asyncio.sleep(3)
-                new_hash = await page.evaluate("window.location.hash")
+                cur = page.url
                 if debug:
                     await page.screenshot(path=f"debug_perf_{hash_route.strip('#/').replace('/', '_')}.png")
-                    print(f"    Tried {hash_route} → ended at {new_hash}")
-                # If we didn't bounce back to login, consider it a success
-                if "login" not in new_hash.lower():
-                    print(f"    Loaded: {new_hash}")
+                    print(f"    Tried {hash_route} → {cur}")
+                if "login" not in cur.lower():
+                    print(f"    Performance page: {cur}")
                     break
             except Exception as e:
                 if debug:
                     print(f"    {hash_route} failed: {e}")
                 continue
 
-        # Also try clicking a Performance/Analytics nav link if visible
+        # Also try clicking nav links
         for label in ["Performance", "Analytics", "My Performance", "Stats"]:
             try:
                 link = page.get_by_role("link", name=label)
@@ -403,31 +457,20 @@ async def scrape_uworld(email, password, headless=False, debug=False):
         # ── NAVIGATE TO INCORRECT QUESTIONS ─────────────────────────────
         print("\n  ❌ Loading incorrect questions list...")
 
-        incorrect_hashes = [
-            "#/qbank/?filter=incorrect",
-            "#/qbank/?status=incorrect",
-            "#/qbank/",
-        ]
-
-        for hash_route in incorrect_hashes:
-            target = f"https://www.uworld.com/app/index.html{hash_route}"
+        base = page.url.split("#")[0].split("?")[0]
+        for hash_route in ["#/qbank/?filter=incorrect", "#/qbank/?status=incorrect", "#/qbank/"]:
             try:
-                await page.goto(target, wait_until="networkidle", timeout=12000)
+                await page.goto(base + hash_route, wait_until="networkidle", timeout=12000)
                 await asyncio.sleep(3)
-                new_hash = await page.evaluate("window.location.hash")
-                if "login" not in new_hash.lower():
-                    print(f"    Loaded: {new_hash}")
+                if "login" not in page.url.lower():
+                    print(f"    Incorrect Qs page: {page.url}")
                     break
             except Exception:
                 continue
 
         # Try clicking an "Incorrect" filter chip/button on the page
-        for sel in [
-            'button:has-text("Incorrect")',
-            'label:has-text("Incorrect")',
-            '[data-testid*="incorrect" i]',
-            'span:has-text("Incorrect")',
-        ]:
+        for sel in ['button:has-text("Incorrect")', 'label:has-text("Incorrect")',
+                    '[data-testid*="incorrect" i]', 'span:has-text("Incorrect")']:
             try:
                 el = page.locator(sel).first
                 if await el.count() > 0:
