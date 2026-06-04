@@ -318,8 +318,50 @@ async def browser_login(email: str, password: str, headless: bool = False, debug
         # Wait for account-page API calls to finish
         await asyncio.sleep(3)
 
-        # Collect cookies before closing
+        # Find subscription ID now so we can visit apps.uworld.com
+        sub_ids_early = []
+        for url in captured:
+            m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
+            if m and m.group(1) not in sub_ids_early:
+                sub_ids_early.append(m.group(1))
+
+        # Pick the real QBank sub ID early (exclude IsSim forms)
+        all_subs_early = next(
+            (v for k, v in captured.items() if "GetAllSubscriptions" in k), None)
+        best_sub_early = None
+        if all_subs_early and isinstance(all_subs_early, list):
+            for item in all_subs_early:
+                if not isinstance(item, dict): continue
+                if item.get("IsSim") or item.get("isSim"): continue
+                if item.get("FormId") or item.get("formId"): continue
+                sid = item.get("SubscriptionId") or item.get("subscriptionId")
+                if sid:
+                    best_sub_early = str(sid)
+                    break
+        if not best_sub_early and sub_ids_early:
+            best_sub_early = sorted(sub_ids_early, key=int)[1 if len(sub_ids_early) > 1 else 0]
+
+        # Visit apps.uworld.com so its auth cookies get set in the browser context
+        if best_sub_early:
+            apps_url = f"{APPS_BASE}/dashboard/{best_sub_early}"
+            print(f"  🔗 Visiting apps.uworld.com to capture auth cookies...")
+            try:
+                apps_page = await ctx.new_page()
+                apps_page.on("response", on_response)
+                await apps_page.goto(apps_url, wait_until="domcontentloaded", timeout=20000)
+                await asyncio.sleep(3)
+                if debug:
+                    print(f"     apps URL: {apps_page.url}")
+                    await apps_page.screenshot(path="debug_04_apps.png")
+            except Exception as e:
+                if debug:
+                    print(f"     apps visit failed: {e}")
+
+        # Collect ALL cookies (now includes apps.uworld.com cookies too)
         cookies = await ctx.cookies()
+        if debug:
+            apps_cookies = [c for c in cookies if "apps.uworld" in c.get("domain","")]
+            print(f"     apps.uworld.com cookies: {len(apps_cookies)}")
 
         await browser.close()
 
@@ -349,50 +391,48 @@ async def browser_login(email: str, password: str, headless: bool = False, debug
 
 # ─── PHASE 2: FIND SUBSCRIPTION ID ───────────────────────────────────────────
 
-def find_medical_sub_id(login_data: dict):
+def find_medical_sub_id(login_data):
     """
-    Determine which subscription ID belongs to the Step 2 CK QBank.
-    Tries in order:
-      1. Parse GetAllSubscriptions for a medical/USMLE product name
-      2. Return the smallest ID (oldest = most likely the main medical sub)
+    Find the Step 2 CK QBank subscription ID.
+    Key rule: exclude IsSim=true entries (self-assessment forms) and
+    anything with 'form', 'self-assessment', or 'free trial' in the name.
+    The real QBank has IsSim=false and 'QBank' in CourseName.
     """
     raw = login_data.get("all_subs_raw")
 
-    def _search(obj, depth=0):
-        if depth > 6:
-            return None
-        if isinstance(obj, dict):
-            name = " ".join(
-                str(v) for v in obj.values() if isinstance(v, str)
-            ).lower()
-            is_medical = any(k in name for k in [
-                "step 2", "step2", "usmle", "ck qbank", "step2ck", "medicine"
-            ])
-            if is_medical:
-                for idf in ["subscriptionId", "id", "courseSubscriptionId",
-                            "subId", "courseId"]:
-                    if obj.get(idf):
-                        return str(obj[idf])
-            for v in obj.values():
-                r = _search(v, depth + 1)
-                if r:
-                    return r
-        elif isinstance(obj, list):
-            for v in obj:
-                r = _search(v, depth + 1)
-                if r:
-                    return r
-        return None
+    if raw and isinstance(raw, list):
+        # First pass: look for explicit QBank, non-sim entry
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            is_sim  = item.get("IsSim") or item.get("isSim") or False
+            form_id = item.get("FormId") or item.get("formId")
+            name    = str(item.get("CourseName") or item.get("courseName") or "").lower()
+            if is_sim or form_id:
+                continue
+            if any(x in name for x in ["self-assessment","free trial","free_trial"]):
+                continue
+            sid = item.get("SubscriptionId") or item.get("subscriptionId")
+            if sid and any(x in name for x in ["qbank","step 2","step2","ck","usmle","medical"]):
+                return str(sid)
 
-    if raw:
-        found = _search(raw)
-        if found:
-            return found
+        # Second pass: any non-sim entry
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            is_sim  = item.get("IsSim") or item.get("isSim") or False
+            form_id = item.get("FormId") or item.get("formId")
+            if not is_sim and not form_id:
+                sid = item.get("SubscriptionId") or item.get("subscriptionId")
+                if sid:
+                    return str(sid)
 
-    # Fallback: use the smallest numeric ID (oldest subscription = main qbank)
-    sub_ids = login_data.get("sub_ids", [])
+    # Fallback: from GetPaymentsForSubscription URLs, pick middle ID
+    # (smallest is often the first self-assessment form, largest may be shelf)
+    sub_ids = sorted(login_data.get("sub_ids", []), key=int)
     if sub_ids:
-        return sorted(sub_ids, key=int)[0]
+        # Pick the second one — first tends to be self-assessment form 1
+        return sub_ids[1] if len(sub_ids) > 1 else sub_ids[0]
 
     return None
 

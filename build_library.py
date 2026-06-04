@@ -268,18 +268,51 @@ async def browser_login_and_discover(headless: bool, debug: bool):
 
         print(f"  ✅ Logged in!")
 
-        # ── Find subscription ID ───────────────────────────────────────
+        # ── Find subscription ID (exclude IsSim self-assessment forms) ──
         sub_ids = []
         for url in captured:
             m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
             if m and m.group(1) not in sub_ids:
                 sub_ids.append(m.group(1))
 
-        # Use the smallest (oldest = main qbank subscription)
-        sub_id = sorted(sub_ids, key=int)[0] if sub_ids else None
+        all_subs = next(
+            (v for k, v in captured.items() if "GetAllSubscriptions" in k), None)
+
+        sub_id = None
+        if all_subs and isinstance(all_subs, list):
+            for item in all_subs:
+                if not isinstance(item, dict): continue
+                if item.get("IsSim") or item.get("isSim"): continue
+                if item.get("FormId") or item.get("formId"): continue
+                name = str(item.get("CourseName") or item.get("courseName") or "").lower()
+                if any(x in name for x in ["self-assessment","free trial"]): continue
+                sid = item.get("SubscriptionId") or item.get("subscriptionId")
+                if sid:
+                    sub_id = str(sid)
+                    break
+
+        if not sub_id and sub_ids:
+            sub_id = sorted(sub_ids, key=int)[1] if len(sub_ids) > 1 else sub_ids[0]
+
         if not sub_id:
             raise RuntimeError(f"Could not find subscription ID. IDs seen: {sub_ids}")
         print(f"  📋 Subscription ID: {sub_id}")
+
+        # ── Visit apps.uworld.com to get its auth cookies ───────────────
+        print(f"  🔗 Visiting apps.uworld.com to capture auth cookies...")
+        try:
+            warm_page = await ctx.new_page()
+            warm_page.on("response", on_response)
+            await warm_page.goto(
+                f"{APPS_BASE}/dashboard/{sub_id}",
+                wait_until="domcontentloaded", timeout=20000
+            )
+            await asyncio.sleep(3)
+            if debug:
+                print(f"     apps URL: {warm_page.url}")
+        except Exception as e:
+            if debug:
+                print(f"     apps visit: {e}")
 
         # ── Navigate to Search page and do one search to find the API ──
         search_url = f"{APPS_BASE}/search/{sub_id}/false"
@@ -292,8 +325,9 @@ async def browser_login_and_discover(headless: bool, debug: bool):
         # Type "patient" in the search box to trigger an API call
         try:
             search_input = await new_page.wait_for_selector(
-                'input[type="text"], input[type="search"], input[placeholder*="search" i], '
-                'input[placeholder*="Question" i], input[placeholder*="keyword" i]',
+                'input[type="text"], input[type="search"], '
+                'input[placeholder*="Question" i], input[placeholder*="keyword" i], '
+                'input[placeholder*="search" i], input[placeholder*="Enter" i]',
                 timeout=8000
             )
             await search_input.fill("patient")
