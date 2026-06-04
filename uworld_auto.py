@@ -418,38 +418,51 @@ async def scrape_uworld(email, password, headless=False, debug=False):
                 await page.screenshot(path="debug_05_qbank_launched.png")
                 print(f"    QBank URL: {page.url}")
 
-        # ── NAVIGATE TO PERFORMANCE ──────────────────────────────────────
+        # ── NAVIGATE TO PERFORMANCE ANALYTICS ───────────────────────────
         print("\n  📊 Loading performance analytics...")
 
-        base = page.url.split("#")[0].split("?")[0]  # e.g. https://medical.uworld.com/app/...
+        # The qbank app uses real path navigation, not hashes.
+        # Base is everything up to the last path segment.
+        # e.g. https://apps.uworld.com/courseapp/usmle/v53/en-US/dashboard/15778134
+        # → app_root = https://apps.uworld.com/courseapp/usmle/v53/en-US/
+        raw_base = page.url.split("#")[0].split("?")[0]
+        import re as _re2
+        m = _re2.match(r'(https://[^/]+(?:/[^/]+){1,5}/)', raw_base)
+        app_root = m.group(1) if m else raw_base.rsplit("/", 1)[0] + "/"
+        print(f"    App root: {app_root}")
 
-        # Try hash routes first, then click nav links
-        perf_hashes = ["#/analytics/", "#/performance/", "#/qbank/analytics/",
-                       "#/qbank/performance/", "#/dashboard/"]
-
-        for hash_route in perf_hashes:
+        # Try path-based performance URLs first, then nav clicks
+        perf_paths = [
+            "analytics", "performance", "stats",
+            "qbank/analytics", "qbank/performance",
+            "reports", "summary",
+        ]
+        for path in perf_paths:
+            target = app_root + path
             try:
-                await page.goto(base + hash_route, wait_until="networkidle", timeout=12000)
+                await page.goto(target, wait_until="networkidle", timeout=12000)
                 await asyncio.sleep(3)
                 cur = page.url
                 if debug:
-                    await page.screenshot(path=f"debug_perf_{hash_route.strip('#/').replace('/', '_')}.png")
-                    print(f"    Tried {hash_route} → {cur}")
-                if "login" not in cur.lower():
+                    await page.screenshot(path=f"debug_perf_{path.replace('/','_')}.png")
+                    print(f"    Tried {target} → {cur}")
+                # Success = didn't get kicked back to login or dashboard unchanged
+                if "login" not in cur.lower() and cur != raw_base:
                     print(f"    Performance page: {cur}")
                     break
             except Exception as e:
                 if debug:
-                    print(f"    {hash_route} failed: {e}")
+                    print(f"    {target} failed: {e}")
                 continue
 
-        # Also try clicking nav links
-        for label in ["Performance", "Analytics", "My Performance", "Stats"]:
+        # Also try clicking nav links by visible label
+        for label in ["Analytics", "Performance", "My Performance", "Stats", "Reports"]:
             try:
                 link = page.get_by_role("link", name=label)
                 if await link.count() > 0:
                     await link.first.click()
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(4)
+                    print(f"    Clicked nav link '{label}': {page.url}")
                     break
             except Exception:
                 continue
@@ -457,13 +470,23 @@ async def scrape_uworld(email, password, headless=False, debug=False):
         # ── NAVIGATE TO INCORRECT QUESTIONS ─────────────────────────────
         print("\n  ❌ Loading incorrect questions list...")
 
-        base = page.url.split("#")[0].split("?")[0]
-        for hash_route in ["#/qbank/?filter=incorrect", "#/qbank/?status=incorrect", "#/qbank/"]:
+        # Try qbank page with incorrect filter
+        raw_base2 = page.url.split("#")[0].split("?")[0]
+        m2 = _re2.match(r'(https://[^/]+(?:/[^/]+){1,5}/)', raw_base2)
+        app_root2 = m2.group(1) if m2 else raw_base2.rsplit("/", 1)[0] + "/"
+
+        qbank_paths = [
+            "qbank?filter=incorrect",
+            "qbank?status=incorrect",
+            "qbank",
+        ]
+        for path in qbank_paths:
+            target = app_root2 + path
             try:
-                await page.goto(base + hash_route, wait_until="networkidle", timeout=12000)
-                await asyncio.sleep(3)
+                await page.goto(target, wait_until="networkidle", timeout=12000)
+                await asyncio.sleep(4)
                 if "login" not in page.url.lower():
-                    print(f"    Incorrect Qs page: {page.url}")
+                    print(f"    QBank page: {page.url}")
                     break
             except Exception:
                 continue
@@ -480,8 +503,8 @@ async def scrape_uworld(email, password, headless=False, debug=False):
             except Exception:
                 continue
 
-        # Give the API calls time to finish
-        await asyncio.sleep(5)
+        # Give the API calls time to finish loading all data
+        await asyncio.sleep(6)
 
         if debug:
             await page.screenshot(path="debug_final.png")
@@ -868,6 +891,9 @@ async def main():
         )
 
         print(f"\n  📦 Captured {len(intercepted)} API responses from UWorld")
+        print("  API endpoints hit:")
+        for url in sorted(intercepted.keys()):
+            print(f"    {url[:120]}")
 
         if not intercepted:
             print("  ⚠️  No API responses captured. UWorld may have blocked the session.")
