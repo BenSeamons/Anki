@@ -360,63 +360,115 @@ async def scrape_uworld(email, password, headless=False, debug=False):
         print(f"  ✅ Logged in! (landed at: {page.url})")
 
         # ── LAUNCH THE QBANK ─────────────────────────────────────────────
-        # After login UWorld shows a subscriptions page with a "Launch" button
-        # per product. We need to click Launch on the medical/Step qbank.
-        # It may open in a new tab, so we watch for that.
-        print("\n  🚀 Launching the QBank...")
-
-        # Wait briefly for the subscriptions page to settle
+        # Don't rely on clicking the UI button — it has an overlay issue.
+        # Instead, extract the direct qbank URL from the API responses
+        # we've already captured (getDashboardAndCartUrls / GetAllSubscriptions).
+        print("\n  🚀 Finding QBank URL from API data...")
         await asyncio.sleep(2)
+
         if debug:
             await page.screenshot(path="debug_04_subscriptions.png")
 
-        # Find the Launch button closest to a medical/Step label.
-        # Strategy: look for a row that contains "Step" or "Medical" or "USMLE"
-        # and click the Launch button inside it.
-        launched = await page.evaluate("""
-            () => {
-                // Find all Launch buttons
-                const buttons = [...document.querySelectorAll('button, a')]
-                    .filter(el => /^launch$/i.test(el.textContent.trim()));
+        qbank_url = None
 
-                if (buttons.length === 0) return 'no_buttons';
+        # 1. Try getDashboardAndCartUrls — most direct source
+        for url, data in intercepted.items():
+            if "getDashboardAndCartUrls" in url or "getDashboard" in url.lower():
+                if debug:
+                    print(f"    getDashboardAndCartUrls data: {json.dumps(data)[:300]}")
+                if isinstance(data, dict):
+                    # Walk all string values looking for an apps.uworld.com URL
+                    def find_url(obj, depth=0):
+                        if depth > 5: return None
+                        if isinstance(obj, str) and "apps.uworld.com" in obj:
+                            return obj
+                        if isinstance(obj, dict):
+                            for v in obj.values():
+                                r = find_url(v, depth+1)
+                                if r: return r
+                        if isinstance(obj, list):
+                            for v in obj:
+                                r = find_url(v, depth+1)
+                                if r: return r
+                        return None
+                    qbank_url = find_url(data)
 
-                // Prefer a button near text mentioning Step/Medical/USMLE/QBank
-                const medical = buttons.find(btn => {
-                    const section = btn.closest('tr, li, div[class*="row"], div[class*="card"], div[class*="product"]');
-                    const text = section ? section.textContent : '';
-                    return /step|medical|usmle|qbank/i.test(text);
-                });
+        # 2. Fall back: construct URL from subscription ID
+        #    Subscription IDs appear in GetPaymentsForSubscription URLs
+        if not qbank_url:
+            sub_ids = []
+            for url in intercepted:
+                m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
+                if m:
+                    sub_ids.append(m.group(1))
+            # Also look inside GetAllSubscriptions response
+            for url, data in intercepted.items():
+                if "GetAllSubscriptions" in url:
+                    if debug:
+                        print(f"    GetAllSubscriptions data: {json.dumps(data)[:400]}")
+                    def find_medical_sub_id(obj, depth=0):
+                        if depth > 5: return None
+                        if isinstance(obj, dict):
+                            name = str(obj.get("productName","") or obj.get("courseName","")
+                                       or obj.get("name","") or obj.get("title","")).lower()
+                            if any(k in name for k in ["step","usmle","medical","qbank"]):
+                                sid = obj.get("id") or obj.get("subscriptionId") or obj.get("courseId")
+                                if sid:
+                                    return str(sid)
+                            for v in obj.values():
+                                r = find_medical_sub_id(v, depth+1)
+                                if r: return r
+                        if isinstance(obj, list):
+                            for v in obj:
+                                r = find_medical_sub_id(v, depth+1)
+                                if r: return r
+                        return None
+                    sid = find_medical_sub_id(data)
+                    if sid:
+                        sub_ids.insert(0, sid)
 
-                const target = medical || buttons[0];
-                target.click();
-                return target.textContent.trim();
-            }
-        """)
-        print(f"    Clicked: {launched}")
+            if sub_ids:
+                # Use the largest ID (most recent subscription)
+                best_id = sorted(sub_ids)[-1]
+                qbank_url = f"https://apps.uworld.com/courseapp/usmle/v53/en-US/dashboard/{best_id}"
+                print(f"    Constructed qbank URL from subscription ID {best_id}")
 
-        if launched == 'no_buttons':
-            # Already inside the qbank — no subscriptions page appeared
-            print("    No Launch button found — may already be inside the qbank")
-        else:
-            # The Launch button may open a new tab. Wait for it.
-            await asyncio.sleep(2)
-            pages = context.pages
-            if len(pages) > 1:
-                # Switch to the newest tab
-                page = pages[-1]
-                await page.bring_to_front()
-                # Re-attach the response interceptor to the new page
-                page.on("response", on_response)
-                print(f"    New tab opened: {page.url}")
-                await page.wait_for_load_state("networkidle", timeout=20000)
-            else:
-                await page.wait_for_load_state("networkidle", timeout=20000)
+        # 3. Last resort: try clicking the button anyway
+        if not qbank_url:
+            print("    Falling back to Launch button click...")
+            try:
+                btn = page.locator('button:has-text("Launch"), a:has-text("Launch")').first
+                if await btn.count() > 0:
+                    async with context.expect_page() as new_page_info:
+                        await btn.click(force=True)
+                    new_page = await new_page_info.value
+                    await new_page.wait_for_load_state("networkidle", timeout=20000)
+                    qbank_url = new_page.url
+                    page = new_page
+                    page.on("response", on_response)
+            except Exception as e:
+                if debug:
+                    print(f"    Button click failed: {e}")
 
-            await asyncio.sleep(3)
-            if debug:
-                await page.screenshot(path="debug_05_qbank_launched.png")
-                print(f"    QBank URL: {page.url}")
+        if not qbank_url:
+            raise RuntimeError(
+                "Could not find the QBank URL. Run with --debug to inspect API responses."
+            )
+
+        print(f"    QBank URL: {qbank_url}")
+
+        # Navigate to the qbank (may open in a new tab context)
+        if page.url != qbank_url:
+            # Open in the current page (cookies carry over since same browser context)
+            new_page = await context.new_page()
+            new_page.on("response", on_response)
+            await new_page.goto(qbank_url, wait_until="networkidle", timeout=25000)
+            page = new_page
+
+        await asyncio.sleep(3)
+        if debug:
+            await page.screenshot(path="debug_05_qbank.png")
+            print(f"    Inside qbank at: {page.url}")
 
         # ── NAVIGATE TO PERFORMANCE ANALYTICS ───────────────────────────
         print("\n  📊 Loading performance analytics...")
