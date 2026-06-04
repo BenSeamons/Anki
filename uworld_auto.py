@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+"""
+uworld_auto.py — Automated UWorld incorrect-question analyzer
+──────────────────────────────────────────────────────────────
+Logs into UWorld, intercepts its internal API calls, grabs your
+performance breakdown + incorrect question list, then asks Claude
+to pinpoint your weak spots.
+
+SETUP (one time):
+    pip install playwright playwright-stealth
+    playwright install chromium
+
+Add to your .env file:
+    UWORLD_EMAIL=you@email.com
+    UWORLD_PASSWORD=yourpassword
+
+RUN:
+    python uworld_auto.py
+    python uworld_auto.py --headless        # no browser window
+    python uworld_auto.py --debug           # saves screenshots + raw API dumps
+    python uworld_auto.py --anki-only       # skip UWorld login, use Anki data only
+"""
+
+import asyncio
+import json
+import os
+import sys
+import argparse
+import getpass
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
+from dotenv import load_dotenv
+import anthropic
+
+load_dotenv()
+
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+
+UWORLD_URL = "https://www.uworld.com/"
+ANKI_CONNECT_URL = "http://localhost:8765"
+OUTPUT_DIR = Path("uworld_reports")
+
+CLAUDE_MODEL = "claude-sonnet-4-6"
+
+ANALYSIS_PROMPT = """You are an expert USMLE tutor. A medical student has shared their UWorld performance data.
+
+Your job: identify their true weak spots and give an actionable study plan.
+
+PERFORMANCE DATA:
+{performance_data}
+
+INCORRECT QUESTIONS ({incorrect_count} total):
+{incorrect_summary}
+
+Produce exactly these sections (be specific and dense, no filler):
+
+## 🔴 Top Weak Systems
+List the 3-5 systems with the lowest % correct. For each, give the exact % and the most likely conceptual gaps based on the question topics listed.
+
+## 🧠 Recurring Concept Gaps
+Identify the specific mechanisms, pathways, or facts that the incorrect question topics point to. Be granular — not just "cardiology" but "distinguish systolic vs diastolic HF management" or "beta-blocker contraindications."
+
+## ⚡ Priority Study Plan (Next 2 Weeks)
+Ordered list. What to hit first, why, and how (specific Anki tags, First Aid sections, or Sketchy videos if applicable).
+
+## 📊 Quick Stats
+- Total questions done: X
+- Overall %: X%
+- Strongest system: X (X%)
+- Weakest system: X (X%)
+- Incorrect questions to review: X
+
+Be direct. This student needs to pass boards, not hear filler."""
+
+
+# ─── ARG PARSING ─────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Automated UWorld weakness analyzer")
+    p.add_argument("--email", help="UWorld email (or set UWORLD_EMAIL in .env)")
+    p.add_argument("--password", help="UWorld password (or set UWORLD_PASSWORD in .env)")
+    p.add_argument("--headless", action="store_true", help="Run browser invisibly")
+    p.add_argument("--debug", action="store_true", help="Save screenshots and raw API data")
+    p.add_argument("--anki-only", action="store_true", help="Skip UWorld login, pull from AnkiConnect only")
+    p.add_argument("--output", default=None, help="Output file path (default: uworld_reports/report_DATE.md)")
+    return p.parse_args()
+
+
+def get_credentials(args):
+    email = args.email or os.getenv("UWORLD_EMAIL") or ""
+    password = args.password or os.getenv("UWORLD_PASSWORD") or ""
+    if not email:
+        email = input("UWorld email: ").strip()
+    if not password:
+        password = getpass.getpass("UWorld password: ")
+    return email, password
+
+
+# ─── ANKI CONNECT HELPER ─────────────────────────────────────────────────────
+
+async def anki_request(action, **params):
+    """Call local AnkiConnect API."""
+    import urllib.request
+    payload = json.dumps({"action": action, "version": 6, "params": params}).encode()
+    try:
+        req = urllib.request.Request(ANKI_CONNECT_URL, data=payload)
+        with urllib.request.urlopen(req, timeout=10) as r:
+            result = json.loads(r.read())
+            if result.get("error"):
+                raise RuntimeError(result["error"])
+            return result["result"]
+    except Exception as e:
+        raise RuntimeError(f"AnkiConnect error: {e}")
+
+
+async def get_anki_weak_cards():
+    """
+    Pull AnKing cards that map to UWorld questions where ease is low
+    (i.e., cards you keep failing in Anki).
+    AnKing tags look like: AK_Step1_v12::UWorld::QID::12345
+    """
+    print("  📚 Querying AnkiConnect for weak AnKing/UWorld cards...")
+
+    # Cards in relearning or with ease < 2000 (struggling)
+    # Also cards due that have lapse count > 1
+    try:
+        # Find all AnKing UWorld-tagged cards that are in 'relearn' or have high lapses
+        note_ids = await anki_request("findNotes", query="tag:AK_Step*UWorld*QID*")
+        if not note_ids:
+            print("  ⚠️  No AnKing UWorld cards found. Is the AnKing deck installed?")
+            return [], []
+
+        print(f"  Found {len(note_ids)} AnKing UWorld-tagged cards total")
+
+        # Get card info for all of them (batch to avoid timeout)
+        BATCH = 500
+        all_cards = []
+        for i in range(0, len(note_ids), BATCH):
+            batch = note_ids[i:i+BATCH]
+            cards_info = await anki_request("notesInfo", notes=batch)
+            all_cards.extend(cards_info)
+
+        # Extract UWorld QIDs from tags and find struggling cards
+        qid_pattern = re.compile(r'QID[_::](\d+)', re.IGNORECASE)
+        weak_qids = []
+        all_qids = []
+
+        for card in all_cards:
+            tags = card.get("tags", [])
+            fields = card.get("fields", {})
+            # Try to determine if this card is "weak" — has lapses in any field or tag hints
+            # We'll pull all QIDs; the weak detection will come from card stats
+            for tag in tags:
+                m = qid_pattern.search(tag)
+                if m:
+                    qid = m.group(1)
+                    all_qids.append(qid)
+                    break
+
+        # Now get card stats to find weak ones
+        # Find cards with lapses > 0 (cards you've failed in Anki)
+        weak_note_ids = await anki_request(
+            "findNotes",
+            query="tag:AK_Step*UWorld*QID* prop:lapses>0"
+        )
+
+        struggling_qids = []
+        if weak_note_ids:
+            weak_cards_info = await anki_request("notesInfo", notes=weak_note_ids[:500])
+            for card in weak_cards_info:
+                for tag in card.get("tags", []):
+                    m = qid_pattern.search(tag)
+                    if m:
+                        struggling_qids.append(m.group(1))
+                        break
+
+        print(f"  Found {len(all_qids)} total UWorld-tagged cards, {len(struggling_qids)} with lapses")
+        return all_qids, struggling_qids
+
+    except RuntimeError as e:
+        print(f"  ⚠️  AnkiConnect not available: {e}")
+        return [], []
+
+
+# ─── UWORLD SCRAPER ──────────────────────────────────────────────────────────
+
+async def scrape_uworld(email, password, headless=False, debug=False):
+    """
+    Log into UWorld and intercept its internal API calls to get:
+    1. Performance breakdown by system/subject
+    2. Full list of incorrect questions with topics
+
+    Returns (performance_data, incorrect_questions) or raises on failure.
+    """
+    try:
+        from playwright.async_api import async_playwright
+    except ImportError:
+        print("\n  Installing Playwright (one-time setup)...")
+        os.system(f"{sys.executable} -m pip install playwright -q")
+        os.system(f"{sys.executable} -m playwright install chromium --quiet")
+        from playwright.async_api import async_playwright
+
+    # Try to import stealth (optional but helps)
+    stealth_available = False
+    try:
+        from playwright_stealth import stealth_async
+        stealth_available = True
+        print("  🥷 Stealth mode active")
+    except ImportError:
+        print("  ℹ️  For better reliability: pip install playwright-stealth")
+
+    intercepted = {}  # url -> parsed JSON response
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"] if not headless else []
+        )
+        context = await browser.new_context(
+            viewport={"width": 1280, "height": 800},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/125.0.0.0 Safari/537.36"
+            )
+        )
+        page = await context.new_page()
+
+        if stealth_available:
+            await stealth_async(page)
+
+        # ── Intercept API responses ──────────────────────────────────────
+        async def on_response(response):
+            url = response.url
+            # Capture JSON responses from UWorld's API
+            if ("uworld.com" in url or "amboss" in url) and response.status == 200:
+                ct = response.headers.get("content-type", "")
+                if "json" in ct:
+                    try:
+                        data = await response.json()
+                        intercepted[url] = data
+                        if debug:
+                            print(f"    🔗 Captured: {url[:80]}")
+                    except Exception:
+                        pass
+
+        page.on("response", on_response)
+
+        # ── LOGIN ────────────────────────────────────────────────────────
+        print("\n  🔐 Logging into UWorld...")
+        await page.goto(UWORLD_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+
+        if debug:
+            await page.screenshot(path="debug_01_landing.png")
+
+        # Try multiple selector strategies for email field
+        email_selectors = [
+            'input[type="email"]',
+            'input[name="email"]',
+            'input[id*="email" i]',
+            'input[placeholder*="email" i]',
+        ]
+        email_field = None
+        for sel in email_selectors:
+            try:
+                email_field = await page.wait_for_selector(sel, timeout=5000)
+                if email_field:
+                    break
+            except Exception:
+                continue
+
+        if not email_field:
+            if debug:
+                await page.screenshot(path="debug_02_no_email_field.png")
+            raise RuntimeError(
+                "Could not find email field on UWorld login page. "
+                "UWorld may have changed their UI. Run with --debug to save screenshots."
+            )
+
+        # Type credentials with small delays (more human-like)
+        await email_field.click()
+        await page.keyboard.type(email, delay=50)
+        await asyncio.sleep(0.5)
+
+        # Password field
+        pwd_selectors = [
+            'input[type="password"]',
+            'input[name="password"]',
+            'input[id*="password" i]',
+        ]
+        pwd_field = None
+        for sel in pwd_selectors:
+            try:
+                pwd_field = await page.wait_for_selector(sel, timeout=3000)
+                if pwd_field:
+                    break
+            except Exception:
+                continue
+
+        if not pwd_field:
+            raise RuntimeError("Could not find password field.")
+
+        await pwd_field.click()
+        await page.keyboard.type(password, delay=50)
+        await asyncio.sleep(0.3)
+
+        # Submit
+        submit_selectors = [
+            'button[type="submit"]',
+            'button:has-text("Sign in")',
+            'button:has-text("Log in")',
+            'button:has-text("Login")',
+            'input[type="submit"]',
+        ]
+        submitted = False
+        for sel in submit_selectors:
+            try:
+                btn = await page.wait_for_selector(sel, timeout=2000)
+                if btn:
+                    await btn.click()
+                    submitted = True
+                    break
+            except Exception:
+                continue
+
+        if not submitted:
+            await page.keyboard.press("Enter")
+
+        # Wait for navigation after login
+        print("  ⏳ Waiting for login to complete...")
+        try:
+            await page.wait_for_url(
+                lambda url: "uworld.com" in url and "login" not in url.lower(),
+                timeout=20000
+            )
+        except Exception:
+            pass  # May already be on the right page
+
+        await asyncio.sleep(3)
+
+        if debug:
+            await page.screenshot(path="debug_03_post_login.png")
+            print(f"    Current URL: {page.url}")
+
+        # Check if login failed
+        if "login" in page.url.lower() or "signin" in page.url.lower():
+            if debug:
+                await page.screenshot(path="debug_04_login_failed.png")
+            raise RuntimeError(
+                "Login appears to have failed. Check your credentials.\n"
+                "If you have 2FA enabled, disable it temporarily or run without --headless to handle it manually."
+            )
+
+        print("  ✅ Logged in successfully!")
+
+        # ── NAVIGATE TO PERFORMANCE ──────────────────────────────────────
+        print("\n  📊 Loading performance analytics...")
+
+        # Try known UWorld performance URLs
+        performance_urls = [
+            "https://www.uworld.com/qbank/performance",
+            "https://www.uworld.com/qbank/analytics",
+            "https://www.uworld.com/qbank/dashboard",
+            "https://www.uworld.com/qbank",
+        ]
+
+        perf_loaded = False
+        for url in performance_urls:
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=15000)
+                await asyncio.sleep(3)
+                if debug:
+                    await page.screenshot(path=f"debug_perf_{url.split('/')[-1]}.png")
+
+                # Check if we got actual content (not a redirect to login)
+                if "login" not in page.url.lower():
+                    perf_loaded = True
+                    print(f"    Loaded: {page.url}")
+                    break
+            except Exception as e:
+                if debug:
+                    print(f"    Failed {url}: {e}")
+                continue
+
+        # Also try clicking Performance link in nav
+        if not perf_loaded or not intercepted:
+            perf_links = [
+                'a:has-text("Performance")',
+                'a:has-text("Analytics")',
+                'a:has-text("My Performance")',
+                '[href*="performance"]',
+                '[href*="analytics"]',
+            ]
+            for sel in perf_links:
+                try:
+                    link = page.locator(sel).first
+                    if await link.count() > 0:
+                        await link.click()
+                        await asyncio.sleep(3)
+                        break
+                except Exception:
+                    continue
+
+        # ── NAVIGATE TO INCORRECT QUESTIONS ─────────────────────────────
+        print("\n  ❌ Loading incorrect questions list...")
+
+        incorrect_urls = [
+            "https://www.uworld.com/qbank?filter=incorrect",
+            "https://www.uworld.com/qbank?status=incorrect",
+            "https://www.uworld.com/qbank/questions?filter=incorrect",
+        ]
+
+        for url in incorrect_urls:
+            try:
+                await page.goto(url, wait_until="networkidle", timeout=15000)
+                await asyncio.sleep(3)
+                if debug:
+                    await page.screenshot(path="debug_incorrect.png")
+                if "login" not in page.url.lower():
+                    print(f"    Loaded: {page.url}")
+                    break
+            except Exception:
+                continue
+
+        # Try clicking filter buttons
+        incorrect_selectors = [
+            'button:has-text("Incorrect")',
+            '[data-filter="incorrect"]',
+            'label:has-text("Incorrect")',
+            'span:has-text("Incorrect")',
+        ]
+        for sel in incorrect_selectors:
+            try:
+                el = page.locator(sel).first
+                if await el.count() > 0:
+                    await el.click()
+                    await asyncio.sleep(3)
+                    break
+            except Exception:
+                continue
+
+        # Give it extra time to load all API responses
+        await asyncio.sleep(5)
+
+        if debug:
+            await page.screenshot(path="debug_final.png")
+            # Save all intercepted data
+            with open("debug_api_responses.json", "w") as f:
+                json.dump({k: v for k, v in list(intercepted.items())[:20]}, f, indent=2, default=str)
+            print(f"    Saved {len(intercepted)} intercepted responses to debug_api_responses.json")
+
+        await browser.close()
+
+    return intercepted
+
+
+# ─── DATA EXTRACTION ─────────────────────────────────────────────────────────
+
+def extract_performance_data(intercepted: dict):
+    """
+    Parse the raw intercepted API responses into structured performance data.
+    UWorld's internal API structure varies, so we look for recognizable patterns.
+    """
+    performance = {
+        "overall": None,
+        "by_system": [],
+        "by_subject": [],
+        "raw_found": False,
+    }
+    incorrect_questions = []
+
+    for url, data in intercepted.items():
+        url_lower = url.lower()
+
+        # Skip tiny responses (likely not data)
+        data_str = json.dumps(data)
+        if len(data_str) < 100:
+            continue
+
+        # ── Look for performance breakdown ──────────────────────────────
+        if any(k in url_lower for k in ["performance", "analytics", "stats", "report"]):
+            performance["raw_found"] = True
+            _parse_performance_blob(data, performance)
+
+        # ── Look for question lists ──────────────────────────────────────
+        if any(k in url_lower for k in ["question", "qbank", "item", "incorrect"]):
+            _parse_question_blob(data, incorrect_questions)
+
+        # ── Try generic extraction on everything ────────────────────────
+        # Sometimes the data is nested, so scan all responses
+        _parse_performance_blob(data, performance)
+        _parse_question_blob(data, incorrect_questions)
+
+    # Deduplicate questions by ID
+    seen_ids = set()
+    unique_questions = []
+    for q in incorrect_questions:
+        qid = q.get("id") or q.get("qid") or q.get("questionId")
+        if qid and qid not in seen_ids:
+            seen_ids.add(qid)
+            unique_questions.append(q)
+
+    return performance, unique_questions
+
+
+def _parse_performance_blob(data, performance):
+    """Recursively look for performance-shaped data in a JSON blob."""
+    if isinstance(data, dict):
+        # Look for overall stats
+        for key in ["overall", "total", "summary", "stats"]:
+            if key in data:
+                sub = data[key]
+                if isinstance(sub, dict):
+                    pct = sub.get("percent") or sub.get("percentage") or sub.get("score")
+                    correct = sub.get("correct") or sub.get("correctCount")
+                    total = sub.get("total") or sub.get("totalCount") or sub.get("count")
+                    if pct is not None and performance["overall"] is None:
+                        performance["overall"] = {
+                            "percent": round(float(pct), 1),
+                            "correct": correct,
+                            "total": total,
+                        }
+
+        # Look for system/subject arrays
+        for key in ["systems", "subjects", "disciplines", "categories", "topics",
+                    "bySystem", "bySubject", "systemBreakdown", "subjectBreakdown"]:
+            if key in data and isinstance(data[key], list):
+                items = data[key]
+                parsed = _parse_category_list(items)
+                if parsed:
+                    if "system" in key.lower() or key in ["systems", "bySystem", "systemBreakdown"]:
+                        performance["by_system"].extend(parsed)
+                    else:
+                        performance["by_subject"].extend(parsed)
+
+        # Recurse into nested dicts
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                _parse_performance_blob(v, performance)
+
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                _parse_performance_blob(item, performance)
+
+
+def _parse_category_list(items):
+    """Parse a list of category performance objects."""
+    results = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = (item.get("name") or item.get("system") or item.get("subject")
+                or item.get("topic") or item.get("category") or item.get("label"))
+        pct = (item.get("percent") or item.get("percentage") or item.get("score")
+               or item.get("correctPercent") or item.get("percentCorrect"))
+        correct = item.get("correct") or item.get("correctCount")
+        total = item.get("total") or item.get("totalCount") or item.get("count")
+
+        if name and pct is not None:
+            results.append({
+                "name": str(name),
+                "percent": round(float(pct), 1),
+                "correct": correct,
+                "total": total,
+            })
+    return results
+
+
+def _parse_question_blob(data, questions):
+    """Recursively find question objects in a JSON blob."""
+    if isinstance(data, dict):
+        # Check if this dict looks like a question
+        qid = (data.get("id") or data.get("qid") or data.get("questionId")
+               or data.get("question_id") or data.get("itemId"))
+        status = str(data.get("status") or data.get("result") or "").lower()
+        is_incorrect = "incorrect" in status or "wrong" in status or data.get("incorrect") is True
+
+        if qid and is_incorrect:
+            questions.append({
+                "id": str(qid),
+                "system": data.get("system") or data.get("bodySystem"),
+                "subject": data.get("subject") or data.get("discipline"),
+                "topic": data.get("topic") or data.get("concept"),
+                "subtopic": data.get("subtopic") or data.get("subTopic"),
+            })
+        elif qid and not status:
+            # Might be in a list of incorrect questions without explicit status
+            questions.append({
+                "id": str(qid),
+                "system": data.get("system") or data.get("bodySystem"),
+                "subject": data.get("subject") or data.get("discipline"),
+                "topic": data.get("topic") or data.get("concept"),
+                "subtopic": data.get("subtopic") or data.get("subTopic"),
+            })
+
+        # Recurse
+        for v in data.values():
+            if isinstance(v, (dict, list)):
+                _parse_question_blob(v, questions)
+
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                _parse_question_blob(item, questions)
+
+
+# ─── SUMMARIZE FOR CLAUDE ─────────────────────────────────────────────────────
+
+def build_performance_summary(performance, incorrect_questions):
+    """Build a readable summary of performance data for Claude."""
+    lines = []
+
+    # Overall
+    if performance["overall"]:
+        o = performance["overall"]
+        lines.append(f"Overall: {o['percent']}% correct ({o.get('correct', '?')}/{o.get('total', '?')} questions)")
+    else:
+        lines.append("Overall: Not found in API data")
+
+    # By system
+    if performance["by_system"]:
+        systems = sorted(performance["by_system"], key=lambda x: x["percent"])
+        lines.append(f"\nPerformance by System ({len(systems)} systems):")
+        for s in systems:
+            total_str = f" ({s['correct']}/{s['total']})" if s.get("total") else ""
+            lines.append(f"  {s['percent']:5.1f}%  {s['name']}{total_str}")
+
+    # By subject
+    if performance["by_subject"]:
+        subjects = sorted(performance["by_subject"], key=lambda x: x["percent"])
+        lines.append(f"\nPerformance by Subject ({len(subjects)} subjects):")
+        for s in subjects[:20]:  # Top 20 weakest
+            total_str = f" ({s['correct']}/{s['total']})" if s.get("total") else ""
+            lines.append(f"  {s['percent']:5.1f}%  {s['name']}{total_str}")
+
+    return "\n".join(lines)
+
+
+def build_incorrect_summary(incorrect_questions):
+    """Summarize incorrect questions by system/topic for Claude."""
+    if not incorrect_questions:
+        return "No incorrect question data extracted."
+
+    # Group by system
+    by_system = defaultdict(list)
+    by_topic = defaultdict(int)
+
+    for q in incorrect_questions:
+        system = q.get("system") or "Unknown System"
+        topic = q.get("topic") or q.get("subject") or "Unknown Topic"
+        by_system[system].append(q)
+        by_topic[topic] += 1
+
+    lines = [f"Total incorrect: {len(incorrect_questions)}"]
+    lines.append("\nIncorrect by System:")
+    for system, qs in sorted(by_system.items(), key=lambda x: -len(x[1])):
+        lines.append(f"  {len(qs):3d}x  {system}")
+
+    lines.append("\nTop Recurring Topics in Incorrects:")
+    for topic, count in sorted(by_topic.items(), key=lambda x: -x[1])[:30]:
+        lines.append(f"  {count:3d}x  {topic}")
+
+    # Sample of question IDs
+    qids = [q["id"] for q in incorrect_questions[:50] if q.get("id")]
+    if qids:
+        lines.append(f"\nSample Question IDs: {', '.join(qids[:20])}")
+
+    return "\n".join(lines)
+
+
+# ─── CLAUDE ANALYSIS ─────────────────────────────────────────────────────────
+
+def analyze_with_claude(performance_summary: str, incorrect_summary: str, incorrect_count: int) -> str:
+    """Send data to Claude and get weakness analysis."""
+    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+    prompt = ANALYSIS_PROMPT.format(
+        performance_data=performance_summary,
+        incorrect_count=incorrect_count,
+        incorrect_summary=incorrect_summary,
+    )
+
+    print("\n  🤖 Asking Claude to analyze your weak spots...")
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text
+
+
+# ─── OUTPUT ──────────────────────────────────────────────────────────────────
+
+def save_report(analysis: str, incorrect_questions: list, performance: dict, output_path: Path):
+    """Save the analysis as a Markdown file."""
+    output_path.parent.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    content = f"""# UWorld Weakness Analysis
+Generated: {timestamp}
+
+---
+
+{analysis}
+
+---
+
+## Raw Data
+
+### Incorrect Question IDs
+```
+{', '.join(q['id'] for q in incorrect_questions if q.get('id'))}
+```
+
+### Incorrect Questions with Topics
+| QID | System | Subject | Topic |
+|-----|--------|---------|-------|
+"""
+    for q in incorrect_questions[:200]:
+        content += f"| {q.get('id','?')} | {q.get('system','?')} | {q.get('subject','?')} | {q.get('topic','?')} |\n"
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    # Also save JSON for use with MedTools UWorld Review tool
+    json_path = output_path.with_suffix(".json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "generated": timestamp,
+            "performance": performance,
+            "incorrect_questions": incorrect_questions,
+            "question_ids": [q["id"] for q in incorrect_questions if q.get("id")],
+        }, f, indent=2)
+
+    print(f"\n  💾 Report saved to: {output_path}")
+    print(f"  💾 JSON data saved to: {json_path}")
+    print(f"     (You can paste the question IDs from the JSON into MedTools UWorld Review)")
+
+
+# ─── FALLBACK: ANKI-ONLY MODE ─────────────────────────────────────────────────
+
+async def run_anki_only_analysis(output_path: Path):
+    """
+    Skip UWorld login entirely.
+    Pull struggling cards from AnkiConnect and analyze with Claude.
+    """
+    print("\n📚 Anki-only mode: pulling weak AnKing/UWorld cards from local Anki...")
+    all_qids, struggling_qids = await get_anki_weak_cards()
+
+    if not all_qids and not struggling_qids:
+        print("❌ No AnKing UWorld cards found. Make sure:")
+        print("   1. Anki is open")
+        print("   2. AnkiConnect is installed")
+        print("   3. The AnKing deck is loaded")
+        return
+
+    performance = {
+        "overall": None,
+        "by_system": [],
+        "by_subject": [],
+        "note": "Pulled from AnkiConnect - no UWorld login data"
+    }
+
+    incorrect_questions = [{"id": qid, "system": None, "subject": None, "topic": None}
+                           for qid in struggling_qids]
+
+    performance_summary = (
+        f"Source: AnkiConnect (local Anki data)\n"
+        f"Total UWorld-tagged AnKing cards: {len(all_qids)}\n"
+        f"Cards with at least 1 lapse (you've struggled with): {len(struggling_qids)}\n"
+        f"\nNote: Full system/topic breakdown not available without UWorld login."
+    )
+    incorrect_summary = build_incorrect_summary(incorrect_questions)
+    incorrect_summary += f"\n\nAnki QIDs with lapses: {', '.join(struggling_qids[:50])}"
+
+    analysis = analyze_with_claude(performance_summary, incorrect_summary, len(struggling_qids))
+    save_report(analysis, incorrect_questions, performance, output_path)
+
+    print("\n" + "="*60)
+    print(analysis)
+    print("="*60)
+
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+async def main():
+    args = parse_args()
+
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_path = Path(args.output) if args.output else OUTPUT_DIR / f"report_{timestamp}.md"
+
+    print("\n" + "="*60)
+    print("  UWorld Auto-Analyzer")
+    print("="*60)
+
+    # ── Anki-only mode ───────────────────────────────────────────────
+    if args.anki_only:
+        await run_anki_only_analysis(output_path)
+        return
+
+    # ── Full UWorld scrape mode ──────────────────────────────────────
+    email, password = get_credentials(args)
+
+    if not email or not password:
+        print("❌ Email and password are required.")
+        print("   Set UWORLD_EMAIL and UWORLD_PASSWORD in your .env file, or pass --email and --password")
+        sys.exit(1)
+
+    # Also check for AnkiConnect data in parallel (used to enrich the analysis)
+    print("\n  🔍 Checking AnkiConnect for additional context...")
+    anki_qids_task = asyncio.create_task(get_anki_weak_cards())
+
+    # Scrape UWorld
+    try:
+        print(f"\n  🌐 Opening UWorld{'(headless)' if args.headless else ' (browser window will open)'}...")
+        if not args.headless:
+            print("  ℹ️  The browser will open — you can watch it work. Don't click anything.")
+            print("  ℹ️  If there's a 2FA prompt, complete it manually.")
+
+        intercepted = await scrape_uworld(
+            email=email,
+            password=password,
+            headless=args.headless,
+            debug=args.debug,
+        )
+
+        print(f"\n  📦 Captured {len(intercepted)} API responses from UWorld")
+
+        if not intercepted:
+            print("  ⚠️  No API responses captured. UWorld may have blocked the session.")
+            print("  💡 Try running without --headless so you can see what happened.")
+            print("  💡 Or try: python uworld_auto.py --anki-only")
+            sys.exit(1)
+
+        # Extract structured data
+        performance, incorrect_questions = extract_performance_data(intercepted)
+
+        print(f"\n  📊 Extracted:")
+        print(f"      Overall: {performance['overall']}")
+        print(f"      Systems: {len(performance['by_system'])} found")
+        print(f"      Subjects: {len(performance['by_subject'])} found")
+        print(f"      Incorrect Qs: {len(incorrect_questions)} found")
+
+    except Exception as e:
+        print(f"\n  ❌ UWorld scraping failed: {e}")
+        print("\n  Falling back to Anki-only mode...")
+        await run_anki_only_analysis(output_path)
+        return
+
+    # Wait for Anki data and enrich if available
+    try:
+        anki_all, anki_weak = await anki_qids_task
+        if anki_weak and not incorrect_questions:
+            print(f"\n  ℹ️  No incorrect questions from UWorld API — using {len(anki_weak)} weak Anki cards instead")
+            incorrect_questions = [{"id": qid, "system": None, "subject": None, "topic": None}
+                                   for qid in anki_weak]
+    except Exception:
+        pass
+
+    if not incorrect_questions and not performance["by_system"]:
+        print("\n  ⚠️  Could not extract usable data from UWorld's API.")
+        print("  This usually means UWorld changed their API structure.")
+        print("  Run with --debug to save raw API responses for inspection.")
+        print("  Or try: python uworld_auto.py --anki-only")
+        sys.exit(1)
+
+    # Build summaries and analyze
+    performance_summary = build_performance_summary(performance, incorrect_questions)
+    incorrect_summary = build_incorrect_summary(incorrect_questions)
+
+    print("\n" + "─"*60)
+    print("PERFORMANCE SUMMARY:")
+    print(performance_summary)
+
+    analysis = analyze_with_claude(performance_summary, incorrect_summary, len(incorrect_questions))
+    save_report(analysis, incorrect_questions, performance, output_path)
+
+    print("\n" + "="*60)
+    print(analysis)
+    print("="*60)
+    print(f"\n✅ Done! Report saved to: {output_path}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

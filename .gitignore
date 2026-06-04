@@ -1,5 +1,8 @@
 # Secrets - never commit these
 .env
+uworld_reports/
+debug_*.png
+debug_api_responses.json
 token.json
 Credentials.json
 medtools-77dfb-firebase-adminsdk-fbsvc-565e4406ea.json
