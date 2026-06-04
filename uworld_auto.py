@@ -261,56 +261,70 @@ async def scrape_uworld(email, password, headless=False, debug=False):
             print(f"    URL: {page.url}")
             print(f"    Hash: {await page.evaluate('window.location.hash')}")
 
-        # Wait for the React app to render the login form
+        # Wait for the AngularJS login form to render
+        # The email field has id="login-email" per the error log
         print("  ⏳ Waiting for login form...")
-        email_field = None
         try:
-            email_field = await page.wait_for_selector(
-                'input[type="email"], input[name="email"], input[id*="email" i], input[placeholder*="email" i]',
-                timeout=15000
-            )
+            await page.wait_for_selector('#login-email', timeout=15000)
         except Exception:
-            pass
-
-        if not email_field:
-            if debug:
-                await page.screenshot(path="debug_02_no_email_field.png")
-                html = await page.content()
-                with open("debug_page_source.html", "w", encoding="utf-8") as f:
-                    f.write(html)
-                print("    Page source saved to debug_page_source.html")
-            raise RuntimeError(
-                "Could not find the email input on the UWorld login page.\n"
-                "Run with --debug to save a screenshot and page source."
-            )
-
-        # Fill email
-        await email_field.click()
-        await email_field.fill("")
-        await page.keyboard.type(email, delay=40)
-        await asyncio.sleep(0.4)
-
-        # Fill password
-        pwd_field = await page.wait_for_selector(
-            'input[type="password"]',
-            timeout=5000
-        )
-        await pwd_field.click()
-        await pwd_field.fill("")
-        await page.keyboard.type(password, delay=40)
-        await asyncio.sleep(0.3)
+            # Fallback to generic email input
+            try:
+                await page.wait_for_selector('input[type="email"]', timeout=5000)
+            except Exception:
+                if debug:
+                    await page.screenshot(path="debug_02_no_form.png")
+                    html = await page.content()
+                    with open("debug_page_source.html", "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print("    Page source saved to debug_page_source.html")
+                raise RuntimeError(
+                    "Could not find the login form on UWorld.\n"
+                    "Run with --debug to save a screenshot."
+                )
 
         if debug:
-            await page.screenshot(path="debug_02_filled.png")
+            await page.screenshot(path="debug_02_form_found.png")
 
-        # Submit — try button first, then Enter
-        try:
-            btn = await page.wait_for_selector(
-                'button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login")',
-                timeout=3000
-            )
-            await btn.click()
-        except Exception:
+        # Fill fields via JS — bypasses the navbar overlay that blocks physical clicks.
+        # Also triggers AngularJS input/change events so the model updates.
+        await page.evaluate("""
+            ([em, pw]) => {
+                function fill(el, val) {
+                    if (!el) return;
+                    el.value = val;
+                    ['input', 'change', 'blur'].forEach(ev =>
+                        el.dispatchEvent(new Event(ev, {bubbles: true}))
+                    );
+                }
+                fill(
+                    document.getElementById('login-email') ||
+                    document.querySelector('input[type="email"]'),
+                    em
+                );
+                fill(
+                    document.querySelector('input[type="password"]'),
+                    pw
+                );
+            }
+        """, [email, password])
+
+        await asyncio.sleep(0.5)
+
+        if debug:
+            await page.screenshot(path="debug_03_filled.png")
+
+        # Click submit via JS to avoid any overlay issues
+        submitted = await page.evaluate("""
+            () => {
+                const btn = document.querySelector('button[type="submit"]') ||
+                            document.querySelector('input[type="submit"]') ||
+                            [...document.querySelectorAll('button')]
+                                .find(b => /sign in|log in|login/i.test(b.textContent));
+                if (btn) { btn.click(); return true; }
+                return false;
+            }
+        """)
+        if not submitted:
             await page.keyboard.press("Enter")
 
         # ── WAIT FOR LOGIN TO COMPLETE ───────────────────────────────────
