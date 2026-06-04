@@ -40,7 +40,7 @@ load_dotenv()
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
-UWORLD_URL = "https://www.uworld.com/"
+UWORLD_URL = "https://www.uworld.com/app/index.html#/login/"
 ANKI_CONNECT_URL = "http://localhost:8765"
 OUTPUT_DIR = Path("uworld_reports")
 
@@ -251,190 +251,169 @@ async def scrape_uworld(email, password, headless=False, debug=False):
         page.on("response", on_response)
 
         # ── LOGIN ────────────────────────────────────────────────────────
+        # UWorld is a hash-based SPA: base URL never changes, only #/route/ does
         print("\n  🔐 Logging into UWorld...")
-        await page.goto(UWORLD_URL, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(UWORLD_URL, wait_until="networkidle", timeout=30000)
         await asyncio.sleep(2)
 
         if debug:
             await page.screenshot(path="debug_01_landing.png")
+            print(f"    URL: {page.url}")
+            print(f"    Hash: {await page.evaluate('window.location.hash')}")
 
-        # Try multiple selector strategies for email field
-        email_selectors = [
-            'input[type="email"]',
-            'input[name="email"]',
-            'input[id*="email" i]',
-            'input[placeholder*="email" i]',
-        ]
+        # Wait for the React app to render the login form
+        print("  ⏳ Waiting for login form...")
         email_field = None
-        for sel in email_selectors:
-            try:
-                email_field = await page.wait_for_selector(sel, timeout=5000)
-                if email_field:
-                    break
-            except Exception:
-                continue
+        try:
+            email_field = await page.wait_for_selector(
+                'input[type="email"], input[name="email"], input[id*="email" i], input[placeholder*="email" i]',
+                timeout=15000
+            )
+        except Exception:
+            pass
 
         if not email_field:
             if debug:
                 await page.screenshot(path="debug_02_no_email_field.png")
+                html = await page.content()
+                with open("debug_page_source.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+                print("    Page source saved to debug_page_source.html")
             raise RuntimeError(
-                "Could not find email field on UWorld login page. "
-                "UWorld may have changed their UI. Run with --debug to save screenshots."
+                "Could not find the email input on the UWorld login page.\n"
+                "Run with --debug to save a screenshot and page source."
             )
 
-        # Type credentials with small delays (more human-like)
+        # Fill email
         await email_field.click()
-        await page.keyboard.type(email, delay=50)
-        await asyncio.sleep(0.5)
+        await email_field.fill("")
+        await page.keyboard.type(email, delay=40)
+        await asyncio.sleep(0.4)
 
-        # Password field
-        pwd_selectors = [
+        # Fill password
+        pwd_field = await page.wait_for_selector(
             'input[type="password"]',
-            'input[name="password"]',
-            'input[id*="password" i]',
-        ]
-        pwd_field = None
-        for sel in pwd_selectors:
-            try:
-                pwd_field = await page.wait_for_selector(sel, timeout=3000)
-                if pwd_field:
-                    break
-            except Exception:
-                continue
-
-        if not pwd_field:
-            raise RuntimeError("Could not find password field.")
-
+            timeout=5000
+        )
         await pwd_field.click()
-        await page.keyboard.type(password, delay=50)
+        await pwd_field.fill("")
+        await page.keyboard.type(password, delay=40)
         await asyncio.sleep(0.3)
 
-        # Submit
-        submit_selectors = [
-            'button[type="submit"]',
-            'button:has-text("Sign in")',
-            'button:has-text("Log in")',
-            'button:has-text("Login")',
-            'input[type="submit"]',
-        ]
-        submitted = False
-        for sel in submit_selectors:
-            try:
-                btn = await page.wait_for_selector(sel, timeout=2000)
-                if btn:
-                    await btn.click()
-                    submitted = True
-                    break
-            except Exception:
-                continue
+        if debug:
+            await page.screenshot(path="debug_02_filled.png")
 
-        if not submitted:
+        # Submit — try button first, then Enter
+        try:
+            btn = await page.wait_for_selector(
+                'button[type="submit"], button:has-text("Sign in"), button:has-text("Log in"), button:has-text("Login")',
+                timeout=3000
+            )
+            await btn.click()
+        except Exception:
             await page.keyboard.press("Enter")
 
-        # Wait for navigation after login
+        # ── WAIT FOR LOGIN TO COMPLETE ───────────────────────────────────
+        # UWorld SPA: after login the hash changes from #/login/ to something else
+        # (e.g. #/dashboard/ or #/qbank/). We can't use wait_for_url because
+        # the base URL stays as /app/index.html the whole time.
         print("  ⏳ Waiting for login to complete...")
         try:
-            await page.wait_for_url(
-                lambda url: "uworld.com" in url and "login" not in url.lower(),
-                timeout=20000
+            await page.wait_for_function(
+                "!window.location.hash.includes('login')",
+                timeout=25000
             )
         except Exception:
-            pass  # May already be on the right page
+            pass
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
 
+        current_hash = await page.evaluate("window.location.hash")
         if debug:
             await page.screenshot(path="debug_03_post_login.png")
-            print(f"    Current URL: {page.url}")
+            print(f"    URL: {page.url}")
+            print(f"    Hash: {current_hash}")
 
-        # Check if login failed
-        if "login" in page.url.lower() or "signin" in page.url.lower():
+        if "login" in current_hash.lower():
             if debug:
                 await page.screenshot(path="debug_04_login_failed.png")
             raise RuntimeError(
-                "Login appears to have failed. Check your credentials.\n"
-                "If you have 2FA enabled, disable it temporarily or run without --headless to handle it manually."
+                "Login failed — still on the login page after submitting.\n"
+                "Check your UWORLD_EMAIL and UWORLD_PASSWORD in .env.\n"
+                "If you have 2FA enabled, run without --headless and complete it manually."
             )
 
-        print("  ✅ Logged in successfully!")
+        print(f"  ✅ Logged in! (route: {current_hash})")
 
         # ── NAVIGATE TO PERFORMANCE ──────────────────────────────────────
         print("\n  📊 Loading performance analytics...")
 
-        # Try known UWorld performance URLs
-        performance_urls = [
-            "https://www.uworld.com/qbank/performance",
-            "https://www.uworld.com/qbank/analytics",
-            "https://www.uworld.com/qbank/dashboard",
-            "https://www.uworld.com/qbank",
+        # UWorld SPA hash routes — try each until one loads data
+        perf_hashes = [
+            "#/analytics/",
+            "#/performance/",
+            "#/qbank/analytics/",
+            "#/qbank/performance/",
+            "#/dashboard/",
         ]
 
-        perf_loaded = False
-        for url in performance_urls:
+        for hash_route in perf_hashes:
+            target = f"https://www.uworld.com/app/index.html{hash_route}"
             try:
-                await page.goto(url, wait_until="networkidle", timeout=15000)
+                await page.goto(target, wait_until="networkidle", timeout=12000)
                 await asyncio.sleep(3)
+                new_hash = await page.evaluate("window.location.hash")
                 if debug:
-                    await page.screenshot(path=f"debug_perf_{url.split('/')[-1]}.png")
-
-                # Check if we got actual content (not a redirect to login)
-                if "login" not in page.url.lower():
-                    perf_loaded = True
-                    print(f"    Loaded: {page.url}")
+                    await page.screenshot(path=f"debug_perf_{hash_route.strip('#/').replace('/', '_')}.png")
+                    print(f"    Tried {hash_route} → ended at {new_hash}")
+                # If we didn't bounce back to login, consider it a success
+                if "login" not in new_hash.lower():
+                    print(f"    Loaded: {new_hash}")
                     break
             except Exception as e:
                 if debug:
-                    print(f"    Failed {url}: {e}")
+                    print(f"    {hash_route} failed: {e}")
                 continue
 
-        # Also try clicking Performance link in nav
-        if not perf_loaded or not intercepted:
-            perf_links = [
-                'a:has-text("Performance")',
-                'a:has-text("Analytics")',
-                'a:has-text("My Performance")',
-                '[href*="performance"]',
-                '[href*="analytics"]',
-            ]
-            for sel in perf_links:
-                try:
-                    link = page.locator(sel).first
-                    if await link.count() > 0:
-                        await link.click()
-                        await asyncio.sleep(3)
-                        break
-                except Exception:
-                    continue
-
-        # ── NAVIGATE TO INCORRECT QUESTIONS ─────────────────────────────
-        print("\n  ❌ Loading incorrect questions list...")
-
-        incorrect_urls = [
-            "https://www.uworld.com/qbank?filter=incorrect",
-            "https://www.uworld.com/qbank?status=incorrect",
-            "https://www.uworld.com/qbank/questions?filter=incorrect",
-        ]
-
-        for url in incorrect_urls:
+        # Also try clicking a Performance/Analytics nav link if visible
+        for label in ["Performance", "Analytics", "My Performance", "Stats"]:
             try:
-                await page.goto(url, wait_until="networkidle", timeout=15000)
-                await asyncio.sleep(3)
-                if debug:
-                    await page.screenshot(path="debug_incorrect.png")
-                if "login" not in page.url.lower():
-                    print(f"    Loaded: {page.url}")
+                link = page.get_by_role("link", name=label)
+                if await link.count() > 0:
+                    await link.first.click()
+                    await asyncio.sleep(3)
                     break
             except Exception:
                 continue
 
-        # Try clicking filter buttons
-        incorrect_selectors = [
-            'button:has-text("Incorrect")',
-            '[data-filter="incorrect"]',
-            'label:has-text("Incorrect")',
-            'span:has-text("Incorrect")',
+        # ── NAVIGATE TO INCORRECT QUESTIONS ─────────────────────────────
+        print("\n  ❌ Loading incorrect questions list...")
+
+        incorrect_hashes = [
+            "#/qbank/?filter=incorrect",
+            "#/qbank/?status=incorrect",
+            "#/qbank/",
         ]
-        for sel in incorrect_selectors:
+
+        for hash_route in incorrect_hashes:
+            target = f"https://www.uworld.com/app/index.html{hash_route}"
+            try:
+                await page.goto(target, wait_until="networkidle", timeout=12000)
+                await asyncio.sleep(3)
+                new_hash = await page.evaluate("window.location.hash")
+                if "login" not in new_hash.lower():
+                    print(f"    Loaded: {new_hash}")
+                    break
+            except Exception:
+                continue
+
+        # Try clicking an "Incorrect" filter chip/button on the page
+        for sel in [
+            'button:has-text("Incorrect")',
+            'label:has-text("Incorrect")',
+            '[data-testid*="incorrect" i]',
+            'span:has-text("Incorrect")',
+        ]:
             try:
                 el = page.locator(sel).first
                 if await el.count() > 0:
@@ -444,15 +423,14 @@ async def scrape_uworld(email, password, headless=False, debug=False):
             except Exception:
                 continue
 
-        # Give it extra time to load all API responses
+        # Give the API calls time to finish
         await asyncio.sleep(5)
 
         if debug:
             await page.screenshot(path="debug_final.png")
-            # Save all intercepted data
             with open("debug_api_responses.json", "w") as f:
-                json.dump({k: v for k, v in list(intercepted.items())[:20]}, f, indent=2, default=str)
-            print(f"    Saved {len(intercepted)} intercepted responses to debug_api_responses.json")
+                json.dump({k: v for k, v in list(intercepted.items())[:30]}, f, indent=2, default=str)
+            print(f"    Saved {len(intercepted)} API responses to debug_api_responses.json")
 
         await browser.close()
 
