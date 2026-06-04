@@ -374,8 +374,8 @@ async def scrape_uworld(email, password, headless=False, debug=False):
         # 1. Try getDashboardAndCartUrls — most direct source
         for url, data in intercepted.items():
             if "getDashboardAndCartUrls" in url or "getDashboard" in url.lower():
-                if debug:
-                    print(f"    getDashboardAndCartUrls data: {json.dumps(data)[:300]}")
+                # Always print this — it's small and critical for debugging
+                print(f"    getDashboardAndCartUrls → {json.dumps(data)[:400]}")
                 if isinstance(data, dict):
                     # Walk all string values looking for an apps.uworld.com URL
                     def find_url(obj, depth=0):
@@ -404,8 +404,8 @@ async def scrape_uworld(email, password, headless=False, debug=False):
             # Also look inside GetAllSubscriptions response
             for url, data in intercepted.items():
                 if "GetAllSubscriptions" in url:
-                    if debug:
-                        print(f"    GetAllSubscriptions data: {json.dumps(data)[:400]}")
+                    # Always print — small and critical
+                    print(f"    GetAllSubscriptions → {json.dumps(data)[:600]}")
                     def find_medical_sub_id(obj, depth=0):
                         if depth > 5: return None
                         if isinstance(obj, dict):
@@ -433,22 +433,39 @@ async def scrape_uworld(email, password, headless=False, debug=False):
                 qbank_url = f"https://apps.uworld.com/courseapp/usmle/v53/en-US/dashboard/{best_id}"
                 print(f"    Constructed qbank URL from subscription ID {best_id}")
 
-        # 3. Last resort: try clicking the button anyway
+        # 3. Try clicking the Launch button and capturing the new tab
         if not qbank_url:
-            print("    Falling back to Launch button click...")
+            print("    Trying Launch button click...")
             try:
-                btn = page.locator('button:has-text("Launch"), a:has-text("Launch")').first
-                if await btn.count() > 0:
-                    async with context.expect_page() as new_page_info:
-                        await btn.click(force=True)
-                    new_page = await new_page_info.value
-                    await new_page.wait_for_load_state("networkidle", timeout=20000)
-                    qbank_url = new_page.url
-                    page = new_page
-                    page.on("response", on_response)
+                # Use expect_page to capture the new tab the moment it opens
+                async with context.expect_page(timeout=8000) as new_page_info:
+                    # JS click bypasses any overlay
+                    clicked = await page.evaluate("""
+                        () => {
+                            const all = [...document.querySelectorAll('button, a')];
+                            // Prefer button near Step/Medical/QBank text
+                            const medical = all.find(el => {
+                                if (!/launch/i.test(el.textContent)) return false;
+                                const row = el.closest('tr,li,div');
+                                return row && /step|medical|usmle|qbank|ck/i.test(row.textContent);
+                            });
+                            const btn = medical || all.find(el => /launch/i.test(el.textContent));
+                            if (btn) { btn.click(); return btn.textContent.trim() || '(clicked)'; }
+                            return null;
+                        }
+                    """)
+                    print(f"    JS clicked: {clicked}")
+                new_page = await new_page_info.value
+                await new_page.wait_for_load_state("networkidle", timeout=25000)
+                qbank_url = new_page.url
+                page = new_page
+                page.on("response", on_response)
+                print(f"    New tab: {qbank_url}")
             except Exception as e:
-                if debug:
-                    print(f"    Button click failed: {e}")
+                print(f"    expect_page timed out ({e}) — checking if current page navigated")
+                await asyncio.sleep(3)
+                if "apps.uworld.com" in page.url:
+                    qbank_url = page.url
 
         if not qbank_url:
             raise RuntimeError(
