@@ -157,12 +157,70 @@ async def run(args):
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=args.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-                "--no-sandbox",
-            ]
+            args=["--disable-blink-features=AutomationControlled"]
         )
+
+        # ── Login context — NO stealth script, plain browser ──────────────
+        # Stealth patches interfere with AngularJS form events on the login page.
+        login_ctx = await browser.new_context(
+            viewport={"width": 1280, "height": 900},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+
+        sub_id_box = {}
+        async def capture_subs(resp):
+            if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
+                try: sub_id_box[resp.url] = await resp.json()
+                except Exception: pass
+
+        page = await login_ctx.new_page()
+        page.on("response", capture_subs)
+
+        print("  🔐 Logging in...")
+        await page.goto("https://www.uworld.com/app/index.html#/login/",
+                        wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2)
+
+        # Use Playwright's native fill() — more reliable than JS, handles Angular
+        try:
+            await page.wait_for_selector("#login-email", timeout=12000)
+            await page.locator("#login-email").fill(email)
+        except Exception:
+            await page.wait_for_selector('input[type="email"]', timeout=5000)
+            await page.locator('input[type="email"]').fill(email)
+        await asyncio.sleep(0.3)
+        await page.locator('input[type="password"]').fill(password)
+        await asyncio.sleep(0.4)
+
+        # Click submit
+        try:
+            await page.locator('button[type="submit"]').click()
+        except Exception:
+            await page.keyboard.press("Enter")
+
+        try: await page.wait_for_function("!window.location.hash.includes('login')", timeout=25000)
+        except Exception: pass
+        await asyncio.sleep(3)
+
+        if "login" in (await page.evaluate("window.location.hash")).lower():
+            if args.debug:
+                await page.screenshot(path="debug_login_failed.png")
+            raise RuntimeError(
+                "Login failed — UWorld rejected credentials or blocked the IP.\n"
+                "Try manually logging in at uworld.com first to verify your account isn't locked."
+            )
+        print(f"  ✅ Logged in!")
+        if args.debug: await page.screenshot(path="debug_01_loggedin.png")
+
+        # Transfer cookies from login context to the qbank context
+        cookies = await login_ctx.cookies()
+        await login_ctx.close()
+
+        # ── QBank context — WITH stealth patches ─────────────────────────
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -173,46 +231,8 @@ async def run(args):
             locale="en-US",
             timezone_id="America/New_York",
         )
-        # Inject stealth script into every page before it loads
         await ctx.add_init_script(STEALTH_SCRIPT)
-
-        # ── Login ─────────────────────────────────────────────────────────
-        sub_id_box = {}
-        async def capture_subs(resp):
-            if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
-                try: sub_id_box[resp.url] = await resp.json()
-                except Exception: pass
-
-        page = await ctx.new_page()
-        page.on("response", capture_subs)
-
-        print("  🔐 Logging in...")
-        await page.goto("https://www.uworld.com/app/index.html#/login/",
-                        wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-
-        try: await page.wait_for_selector("#login-email", timeout=12000)
-        except Exception: await page.wait_for_selector('input[type="email"]', timeout=5000)
-
-        await page.evaluate("""([em,pw]) => {
-            function fill(el,v){if(!el)return;el.value=v;
-                ['input','change','blur'].forEach(e=>el.dispatchEvent(new Event(e,{bubbles:true})));}
-            fill(document.getElementById('login-email')||document.querySelector('input[type=email]'),em);
-            fill(document.querySelector('input[type=password]'),pw);
-        }""", [email, password])
-        await asyncio.sleep(0.4)
-        await page.evaluate("""() => {
-            const b=document.querySelector('button[type=submit]')||
-                [...document.querySelectorAll('button')].find(b=>/sign in|log in|login/i.test(b.textContent));
-            if(b)b.click();
-        }""")
-        try: await page.wait_for_function("!window.location.hash.includes('login')", timeout=25000)
-        except Exception: pass
-        await asyncio.sleep(3)
-        if "login" in (await page.evaluate("window.location.hash")).lower():
-            raise RuntimeError("Login failed. Check UWORLD_EMAIL / UWORLD_PASSWORD in .env")
-        print(f"  ✅ Logged in!")
-        if args.debug: await page.screenshot(path="debug_01_loggedin.png")
+        await ctx.add_cookies(cookies)  # carry login session over
 
         # ── Find subscription ID ──────────────────────────────────────────
         await asyncio.sleep(2)
