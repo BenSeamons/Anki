@@ -4,28 +4,26 @@ build_library.py — Build a local database mapping every UWorld question ID
                    to its Subject / System / Topic / %Correct.
 
 HOW IT WORKS:
-  1. Logs into UWorld (browser, one time).
-  2. Navigates to the Search page and intercepts the search API endpoint.
-  3. Calls that endpoint directly (no browser) for each search term.
-  4. Saves results incrementally to uworld_library.json after every term.
-  5. Stops when coverage plateaus (no new IDs in the last N terms).
+  1. Logs into UWorld, clicks Launch to enter the qbank.
+  2. Uses page.evaluate(fetch(...)) to call the search API from INSIDE
+     the browser — this uses the browser's localStorage JWT automatically.
+  3. Tries multiple search terms (system names, common words) to cover
+     all questions. Saves incrementally after every term.
 
 RUN:
-    python build_library.py                  # uses .env credentials
-    python build_library.py --headless       # no visible browser
-    python build_library.py --resume         # skip terms already done (default)
-    python build_library.py --fresh          # wipe library and start over
-    python build_library.py --show           # print library stats and exit
+    python build_library.py              # full run
+    python build_library.py --headless   # no browser window
+    python build_library.py --fresh      # wipe and start over
+    python build_library.py --show       # print library stats and exit
+    python build_library.py --debug      # verbose output + screenshots
 """
 
 import asyncio
 import json
 import os
+import re
 import sys
 import argparse
-import re
-import time
-import httpx
 from datetime import datetime
 from pathlib import Path
 
@@ -37,70 +35,32 @@ PROGRESS_PATH = Path("uworld_library_progress.json")
 APPS_BASE     = "https://apps.uworld.com/courseapp/usmle/v53/en-US"
 
 # ─── SEARCH TERMS ─────────────────────────────────────────────────────────────
-# Strategy: UWorld returns max 1000 results per search.
-# Searching by system name hits clean, mostly non-overlapping subsets.
-# Generic words mop up anything the system searches miss.
+# UWorld returns max ~1000 results per search.
+# System names give clean non-overlapping subsets.
+# Common words mop up cross-system questions.
 
 SEARCH_TERMS = [
-    # ── By system (covers the vast majority) ──
-    "cardiovascular",
-    "renal",
-    "pulmonary",
-    "gastrointestinal",
-    "endocrine",
-    "neurology",
-    "hematology",
-    "infectious",
-    "obstetrics",
-    "gynecology",
-    "pediatrics",
-    "psychiatry",
-    "dermatology",
-    "musculoskeletal",
-    "oncology",
-    "surgery",
-    "emergency",
-    "biostatistics",
-    "pharmacology",
-    "immunology",
-    # ── Common vignette words (mop up cross-system questions) ──
-    "fever",
-    "chest pain",
-    "abdominal pain",
-    "headache",
-    "fatigue",
-    "shortness of breath",
-    "hypertension",
-    "diabetes",
-    "pregnancy",
-    "trauma",
-    "blood",
-    "biopsy",
-    "fracture",
-    "weight loss",
-    "nausea",
-    "seizure",
-    "rash",
-    "vision",
-    "hearing",
-    "urinary",
-    "sexual",
-    "alcohol",
-    "smoking",
-    "vaccine",
-    "antibiotic",
-    "screening",
-    "ethics",
+    # By system (core coverage)
+    "cardiovascular", "renal", "pulmonary", "gastrointestinal",
+    "endocrine", "neurology", "hematology", "infectious",
+    "obstetrics", "gynecology", "pediatrics", "psychiatry",
+    "dermatology", "musculoskeletal", "oncology", "surgery",
+    "emergency", "biostatistics", "pharmacology", "immunology",
+    # Common vignette words (mop up)
+    "fever", "chest", "abdominal", "headache", "fatigue",
+    "shortness", "hypertension", "diabetes", "pregnancy",
+    "trauma", "blood", "fracture", "weight", "nausea",
+    "seizure", "rash", "vision", "urinary", "alcohol",
+    "screening", "ethics", "vaccine", "antibiotic",
 ]
 
 
 # ─── ARG PARSING ─────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Build UWorld question library")
+    p = argparse.ArgumentParser()
     p.add_argument("--headless", action="store_true")
     p.add_argument("--fresh",    action="store_true", help="Wipe and rebuild")
-    p.add_argument("--resume",   action="store_true", help="Skip completed terms (default)")
     p.add_argument("--show",     action="store_true", help="Print stats and exit")
     p.add_argument("--debug",    action="store_true")
     return p.parse_args()
@@ -124,7 +84,7 @@ def load_progress():
     if PROGRESS_PATH.exists():
         with open(PROGRESS_PATH, encoding="utf-8") as f:
             return json.load(f)
-    return {"completed_terms": [], "api_endpoint": None, "sub_id": None}
+    return {"completed_terms": [], "sub_id": None}
 
 
 def save_progress(prog):
@@ -136,317 +96,417 @@ def show_stats(lib):
     if not lib:
         print("Library is empty.")
         return
-    subjects = {}
-    systems  = {}
-    topics   = {}
+    subjects, systems, topics = {}, {}, {}
     for q in lib.values():
-        subjects[q.get("subject", "?")] = subjects.get(q.get("subject", "?"), 0) + 1
-        systems [q.get("system",  "?")] = systems .get(q.get("system",  "?"), 0) + 1
-        topics  [q.get("topic",   "?")] = topics  .get(q.get("topic",   "?"), 0) + 1
+        s = q.get("subject","?"); subjects[s] = subjects.get(s, 0) + 1
+        s = q.get("system", "?"); systems [s] = systems .get(s, 0) + 1
+        t = q.get("topic",  "?"); topics  [t] = topics  .get(t, 0) + 1
 
     print(f"\n{'='*55}")
     print(f"  UWorld Library: {len(lib)} questions")
     print(f"{'='*55}")
-    print(f"\nBy Subject:")
+    print("\nBy Subject:")
     for s, n in sorted(subjects.items(), key=lambda x: -x[1]):
         print(f"  {n:4d}  {s}")
-    print(f"\nBy System (top 20):")
+    print("\nBy System (top 20):")
     for s, n in sorted(systems.items(), key=lambda x: -x[1])[:20]:
         print(f"  {n:4d}  {s}")
-    print(f"\nTotal unique topics: {len(topics)}")
+    missing = sum(1 for q in lib.values() if not q.get("topic"))
+    print(f"\n  Total unique topics: {len(topics)}")
+    print(f"  Questions missing topic: {missing}")
 
 
-# ─── BROWSER LOGIN ────────────────────────────────────────────────────────────
+# ─── BROWSER SETUP ───────────────────────────────────────────────────────────
 
-async def browser_login_and_discover(headless: bool, debug: bool):
-    """
-    Log in, then navigate to the Search page and make one search to
-    intercept the exact API endpoint URL. Returns login_data dict.
-    """
+async def launch_browser(headless: bool):
     from playwright.async_api import async_playwright
+    pw      = await async_playwright().start()
+    browser = await pw.chromium.launch(
+        headless=headless,
+        args=["--disable-blink-features=AutomationControlled"]
+    )
+    ctx = await browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+        )
+    )
+    return pw, browser, ctx
 
-    captured   = {}
-    token_box  = {}
-    search_api = {}   # will hold {"url_template": ..., "headers": ...}
 
-    async def on_response(resp):
-        url = resp.url
-        if "uworld.com" not in url:
-            return
-        ct = resp.headers.get("content-type", "")
-        if "json" not in ct:
-            return
-        try:
-            body = await resp.json()
-            captured[url] = body
+# ─── LOGIN ───────────────────────────────────────────────────────────────────
 
-            # Grab JWT
-            if not token_box.get("token"):
-                if "refreshToken" in url or ("auth" in url and "userapi" in url):
-                    for field in ["accessToken","token","jwt","access_token","bearerToken"]:
-                        val = body.get(field) if isinstance(body, dict) else None
-                        if val and isinstance(val, str) and len(val) > 20:
-                            token_box["token"] = val
-                            break
-
-            # Detect search API endpoint
-            if not search_api.get("url") and (
-                "search" in url.lower() and "gateway-api" in url
-                or "search" in url.lower() and "apps.uworld" in url
-            ):
-                search_api["url"] = url
-                search_api["status"] = resp.status
-                if debug:
-                    print(f"  🔍 Search API discovered: {url}")
-                    print(f"     Response: {json.dumps(body)[:200]}")
-
-        except Exception:
-            pass
-
+async def login(ctx, debug: bool):
+    """Login and return the page (still on account page)."""
     email    = os.getenv("UWORLD_EMAIL")    or input("UWorld email: ").strip()
     password = os.getenv("UWORLD_PASSWORD") or __import__("getpass").getpass("UWorld password: ")
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=headless,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        ctx  = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-            )
-        )
-        page = await ctx.new_page()
-        page.on("response", on_response)
+    page = await ctx.new_page()
+    print("  🔐 Logging in...")
+    await page.goto("https://www.uworld.com/app/index.html#/login/",
+                    wait_until="networkidle", timeout=30000)
+    await asyncio.sleep(2)
 
-        # ── Login ───────────────────────────────────────────────────────
-        print("  🔐 Logging in...")
-        await page.goto("https://www.uworld.com/app/index.html#/login/",
-                        wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
+    try:
+        await page.wait_for_selector("#login-email", timeout=15000)
+    except Exception:
+        await page.wait_for_selector('input[type="email"]', timeout=5000)
 
-        try:
-            await page.wait_for_selector("#login-email", timeout=15000)
-        except Exception:
-            await page.wait_for_selector('input[type="email"]', timeout=5000)
-
-        await page.evaluate("""
-            ([em, pw]) => {
-                function fill(el, val) {
-                    if (!el) return;
-                    el.value = val;
-                    ['input','change','blur'].forEach(ev =>
-                        el.dispatchEvent(new Event(ev, {bubbles:true})));
-                }
-                fill(document.getElementById('login-email') ||
-                     document.querySelector('input[type="email"]'), em);
-                fill(document.querySelector('input[type="password"]'), pw);
+    await page.evaluate("""
+        ([em, pw]) => {
+            function fill(el, val) {
+                if (!el) return;
+                el.value = val;
+                ['input','change','blur'].forEach(ev =>
+                    el.dispatchEvent(new Event(ev, {bubbles:true})));
             }
-        """, [email, password])
+            fill(document.getElementById('login-email') ||
+                 document.querySelector('input[type="email"]'), em);
+            fill(document.querySelector('input[type="password"]'), pw);
+        }
+    """, [email, password])
+    await asyncio.sleep(0.4)
 
-        await asyncio.sleep(0.4)
-        await page.evaluate("""
-            () => {
-                const btn = document.querySelector('button[type="submit"]') ||
-                    [...document.querySelectorAll('button')]
-                        .find(b => /sign in|log in|login/i.test(b.textContent));
-                if (btn) btn.click();
-            }
-        """)
+    await page.evaluate("""
+        () => {
+            const btn = document.querySelector('button[type="submit"]') ||
+                [...document.querySelectorAll('button')]
+                    .find(b => /sign in|log in|login/i.test(b.textContent));
+            if (btn) btn.click();
+        }
+    """)
 
-        try:
-            await page.wait_for_function(
-                "!window.location.hash.includes('login')", timeout=25000)
-        except Exception:
-            pass
-        await asyncio.sleep(3)
+    try:
+        await page.wait_for_function(
+            "!window.location.hash.includes('login')", timeout=25000)
+    except Exception:
+        pass
+    await asyncio.sleep(3)
 
-        if "login" in (await page.evaluate("window.location.hash")).lower():
-            raise RuntimeError("Login failed. Check UWORLD_EMAIL / UWORLD_PASSWORD.")
-
-        print(f"  ✅ Logged in!")
-
-        # ── Find subscription ID (exclude IsSim self-assessment forms) ──
-        sub_ids = []
-        for url in captured:
-            m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
-            if m and m.group(1) not in sub_ids:
-                sub_ids.append(m.group(1))
-
-        all_subs = next(
-            (v for k, v in captured.items() if "GetAllSubscriptions" in k), None)
-
-        sub_id = None
-        if all_subs and isinstance(all_subs, list):
-            for item in all_subs:
-                if not isinstance(item, dict): continue
-                if item.get("IsSim") or item.get("isSim"): continue
-                if item.get("FormId") or item.get("formId"): continue
-                name = str(item.get("CourseName") or item.get("courseName") or "").lower()
-                if any(x in name for x in ["self-assessment","free trial"]): continue
-                sid = item.get("SubscriptionId") or item.get("subscriptionId")
-                if sid:
-                    sub_id = str(sid)
-                    break
-
-        if not sub_id and sub_ids:
-            sub_id = sorted(sub_ids, key=int)[1] if len(sub_ids) > 1 else sub_ids[0]
-
-        if not sub_id:
-            raise RuntimeError(f"Could not find subscription ID. IDs seen: {sub_ids}")
-        print(f"  📋 Subscription ID: {sub_id}")
-
-        # ── Visit apps.uworld.com to get its auth cookies ───────────────
-        print(f"  🔗 Visiting apps.uworld.com to capture auth cookies...")
-        try:
-            warm_page = await ctx.new_page()
-            warm_page.on("response", on_response)
-            await warm_page.goto(
-                f"{APPS_BASE}/dashboard/{sub_id}",
-                wait_until="domcontentloaded", timeout=20000
-            )
-            await asyncio.sleep(3)
-            if debug:
-                print(f"     apps URL: {warm_page.url}")
-        except Exception as e:
-            if debug:
-                print(f"     apps visit: {e}")
-
-        # ── Navigate to Search page and do one search to find the API ──
-        search_url = f"{APPS_BASE}/search/{sub_id}/false"
-        print(f"  🔍 Opening search page to discover API endpoint...")
-        new_page = await ctx.new_page()
-        new_page.on("response", on_response)
-        await new_page.goto(search_url, wait_until="networkidle", timeout=20000)
-        await asyncio.sleep(2)
-
-        # Type "patient" in the search box to trigger an API call
-        try:
-            search_input = await new_page.wait_for_selector(
-                'input[type="text"], input[type="search"], '
-                'input[placeholder*="Question" i], input[placeholder*="keyword" i], '
-                'input[placeholder*="search" i], input[placeholder*="Enter" i]',
-                timeout=8000
-            )
-            await search_input.fill("patient")
-            await asyncio.sleep(0.3)
-            await new_page.keyboard.press("Enter")
-            await asyncio.sleep(4)  # wait for API call
-        except Exception as e:
-            if debug:
-                print(f"  Search input: {e}")
-
-        if debug:
-            await new_page.screenshot(path="debug_search.png")
-            print(f"  Search page URL: {new_page.url}")
-
-        cookies = await ctx.cookies()
-        await browser.close()
-
-    # Print all captured endpoints to help identify the search API
-    print(f"\n  Captured {len(captured)} API responses.")
-    search_candidates = [u for u in captured if "search" in u.lower() or "question" in u.lower()]
-    if search_candidates:
-        print("  Search/question API candidates:")
-        for u in search_candidates:
-            print(f"    {u[:100]}")
-    elif debug:
-        print("  All captured endpoints:")
-        for u in sorted(captured.keys()):
-            print(f"    {u[:100]}")
-
-    return {
-        "token":      token_box.get("token"),
-        "cookies":    cookies,
-        "sub_id":     sub_id,
-        "search_api": search_api.get("url"),
-        "intercepted": captured,
-    }
+    if "login" in (await page.evaluate("window.location.hash")).lower():
+        raise RuntimeError("Login failed. Check UWORLD_EMAIL / UWORLD_PASSWORD.")
+    print(f"  ✅ Logged in!")
+    if debug:
+        await page.screenshot(path="debug_01_loggedin.png")
+    return page
 
 
-# ─── SEARCH API CALLER ────────────────────────────────────────────────────────
+# ─── FIND SUBSCRIPTION ID ────────────────────────────────────────────────────
 
-def _headers(login_data):
-    token   = login_data.get("token")
-    cookies = login_data.get("cookies", [])
-    h = {
-        "Accept":     "application/json, text/plain, */*",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0.0.0",
-        "Origin":     "https://apps.uworld.com",
-        "Referer":    "https://apps.uworld.com/",
-    }
-    if token:
-        h["Authorization"] = f"Bearer {token}"
-    cookie_str = "; ".join(
-        f"{c['name']}={c['value']}"
-        for c in cookies if "uworld.com" in c.get("domain","")
-    )
-    if cookie_str:
-        h["Cookie"] = cookie_str
-    return h
+async def get_sub_id(ctx, debug: bool):
+    """Intercept GetAllSubscriptions to find the real QBank subscription ID."""
+    captured = {}
+
+    async def on_resp(resp):
+        if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
+            try:
+                captured[resp.url] = await resp.json()
+            except Exception:
+                pass
+
+    # Attach to all existing pages
+    for p in ctx.pages:
+        p.on("response", on_resp)
+
+    # Wait briefly for any in-flight calls
+    await asyncio.sleep(2)
+
+    sub_ids = []
+    for url in captured:
+        m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
+        if m and m.group(1) not in sub_ids:
+            sub_ids.append(m.group(1))
+
+    all_subs = next((v for k, v in captured.items() if "GetAllSubscriptions" in k), None)
+
+    sub_id = None
+    if all_subs and isinstance(all_subs, list):
+        for item in all_subs:
+            if not isinstance(item, dict): continue
+            if item.get("IsSim") or item.get("isSim"): continue
+            if item.get("FormId") or item.get("formId"): continue
+            name = str(item.get("CourseName") or item.get("courseName") or "").lower()
+            if any(x in name for x in ["self-assessment","free trial"]): continue
+            sid = item.get("SubscriptionId") or item.get("subscriptionId")
+            if sid:
+                sub_id = str(sid)
+                if debug:
+                    print(f"    Found QBank sub: {name} → {sid}")
+                break
+
+    if not sub_id and sub_ids:
+        sub_ids_sorted = sorted(sub_ids, key=int)
+        sub_id = sub_ids_sorted[1] if len(sub_ids_sorted) > 1 else sub_ids_sorted[0]
+
+    return sub_id
 
 
-def _build_search_urls(term: str, sub_id: str, discovered_url: str = None):
+# ─── ENTER THE QBANK ─────────────────────────────────────────────────────────
+
+async def enter_qbank(ctx, sub_id: str, debug: bool):
     """
-    Return a list of candidate search API URLs to try.
-    If we discovered the real endpoint from the browser, put it first.
+    Navigate to the qbank. Tries:
+      1. Extract href from Launch button and navigate directly
+      2. Click Launch button and capture new tab
+      3. Navigate directly to dashboard URL
+    Returns the page inside the qbank.
+    """
+    # Get the account page (should be open)
+    account_page = ctx.pages[0] if ctx.pages else None
+    if not account_page:
+        raise RuntimeError("No account page found")
+
+    # Try to get the launch URL from the button's href
+    launch_url = await account_page.evaluate("""
+        () => {
+            const all = [...document.querySelectorAll('a, button')];
+            for (const el of all) {
+                if (!/launch/i.test(el.textContent)) continue;
+                // Check if it or its parent has an href
+                const href = el.href || el.closest('a')?.href;
+                if (href && href.includes('uworld.com')) return href;
+            }
+            return null;
+        }
+    """)
+
+    if launch_url and "apps.uworld.com" in launch_url:
+        print(f"  🚀 Found launch URL: {launch_url[:70]}")
+        qb_page = await ctx.new_page()
+        await qb_page.goto(launch_url, wait_until="domcontentloaded", timeout=25000)
+        await asyncio.sleep(4)
+        if debug:
+            await qb_page.screenshot(path="debug_02_qbank.png")
+            print(f"     Qbank URL: {qb_page.url}")
+        return qb_page
+
+    # Try clicking Launch and catching new tab
+    print("  🚀 Clicking Launch button...")
+    try:
+        async with ctx.expect_page(timeout=8000) as pg_info:
+            await account_page.evaluate("""
+                () => {
+                    const all = [...document.querySelectorAll('a, button')];
+                    const medical = all.find(el => {
+                        if (!/launch/i.test(el.textContent)) return false;
+                        const row = el.closest('tr,li,div');
+                        return !row || /step|ck|qbank|medical/i.test(row.textContent);
+                    }) || all.find(el => /launch/i.test(el.textContent));
+                    if (medical) medical.click();
+                }
+            """)
+        qb_page = await pg_info.value
+        await qb_page.wait_for_load_state("domcontentloaded", timeout=20000)
+        await asyncio.sleep(4)
+        if "apps.uworld.com" in qb_page.url:
+            print(f"  ✅ In qbank: {qb_page.url[:70]}")
+            return qb_page
+    except Exception as e:
+        if debug:
+            print(f"     Launch click: {e}")
+
+    # Direct navigation fallback
+    print(f"  🚀 Navigating directly to qbank...")
+    qb_page = await ctx.new_page()
+    direct_url = f"{APPS_BASE}/dashboard/{sub_id}"
+    await qb_page.goto(direct_url, wait_until="domcontentloaded", timeout=25000)
+    await asyncio.sleep(4)
+    if debug:
+        await qb_page.screenshot(path="debug_02_qbank_direct.png")
+        print(f"     URL: {qb_page.url}")
+
+    if "login" in qb_page.url.lower():
+        raise RuntimeError(
+            "Could not enter the qbank — redirected to login.\n"
+            "The Launch button needs to be clicked to authenticate on apps.uworld.com."
+        )
+
+    print(f"  ✅ In qbank: {qb_page.url[:70]}")
+    return qb_page
+
+
+# ─── SEARCH FROM INSIDE THE BROWSER ─────────────────────────────────────────
+
+async def search_in_browser(qb_page, sub_id: str, term: str, debug: bool):
+    """
+    Call the search API using fetch() from inside the browser page.
+    The browser has the JWT in localStorage / cookies so this works
+    even when direct httpx calls return empty responses.
+
+    Returns list of {id, subject, system, topic, pct_correct} dicts.
     """
     import urllib.parse
     q = urllib.parse.quote(term)
-    candidates = []
 
-    # If we discovered the real endpoint, derive template from it
-    if discovered_url:
-        # Replace the query param value in the discovered URL
-        # Common patterns: ?query=X, ?q=X, ?keyword=X, ?search=X, /search/X
-        templated = re.sub(r'([?&](?:query|q|keyword|search|term)=)[^&]+', f'\\g<1>{q}',
-                           discovered_url)
-        if templated != discovered_url:
-            candidates.append(templated)
-        # Also try replacing path segment
-        templated2 = re.sub(r'/search/[^/]+(/|$)', f'/search/{q}\\1', discovered_url)
-        if templated2 != discovered_url:
-            candidates.append(templated2)
-
-    # Gateway API guesses
-    base_gw = "https://gateway-api.uworld.com/api"
-    candidates += [
-        f"{base_gw}/search/questions?subscriptionId={sub_id}&query={q}&pageSize=1000",
-        f"{base_gw}/search/questions?subscriptionId={sub_id}&q={q}&pageSize=1000",
-        f"{base_gw}/questions/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
-        f"{base_gw}/qbank/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
-        f"{base_gw}/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
-        f"{base_gw}/search?subscriptionId={sub_id}&q={q}&pageSize=1000",
-        f"{base_gw}/qbank/questions?subscriptionId={sub_id}&search={q}&pageSize=1000",
-        f"{base_gw}/items/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
+    # Candidate search API paths to try (run inside browser via fetch)
+    candidates = [
+        f"{APPS_BASE}/api/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
+        f"{APPS_BASE}/api/search?subscriptionId={sub_id}&q={q}&pageSize=1000",
+        f"{APPS_BASE}/api/questions/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
+        f"https://gateway-api.uworld.com/api/search/questions?subscriptionId={sub_id}&query={q}&pageSize=1000",
+        f"https://gateway-api.uworld.com/api/questions/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
+        f"https://gateway-api.uworld.com/api/qbank/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
+        f"https://gateway-api.uworld.com/api/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
     ]
-    # Apps API guesses
-    base_app = f"https://apps.uworld.com/courseapp/usmle/v53/en-US/api"
-    candidates += [
-        f"{base_app}/search?subscriptionId={sub_id}&query={q}&pageSize=1000",
-        f"{base_app}/questions/search?query={q}&subscriptionId={sub_id}&pageSize=1000",
-    ]
-    return candidates
 
+    for url in candidates:
+        try:
+            result = await qb_page.evaluate(f"""
+                async () => {{
+                    try {{
+                        const resp = await fetch({json.dumps(url)}, {{
+                            method: 'GET',
+                            credentials: 'include',
+                            headers: {{
+                                'Accept': 'application/json',
+                                'Content-Type': 'application/json',
+                            }}
+                        }});
+                        const text = await resp.text();
+                        return {{status: resp.status, body: text, url: resp.url}};
+                    }} catch(e) {{
+                        return {{error: e.toString()}};
+                    }}
+                }}
+            """)
+
+            if result.get("error"):
+                if debug:
+                    print(f"    fetch error {url[:70]}: {result['error']}")
+                continue
+
+            status = result.get("status", 0)
+            body   = result.get("body", "")
+
+            if debug:
+                print(f"    {status}  {url[:80]}")
+                if body:
+                    print(f"      body[:100]: {body[:100]}")
+
+            if status != 200 or not body:
+                continue
+
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError:
+                if debug:
+                    print(f"      non-JSON body: {body[:80]}")
+                continue
+
+            items = _parse_search_results(data)
+            if items:
+                print(f"    ✅ {len(items)} results from {url[:70]}")
+                return items
+
+        except Exception as e:
+            if debug:
+                print(f"    eval error: {e}")
+            continue
+
+    # If API calls failed, try scraping the search page DOM directly
+    return await scrape_search_page(qb_page, sub_id, term, debug)
+
+
+async def scrape_search_page(qb_page, sub_id: str, term: str, debug: bool):
+    """
+    Navigate to the search page, fill the input via JS, wait for results,
+    then extract the table rows from the DOM.
+    """
+    search_url = f"{APPS_BASE}/search/{sub_id}/false"
+
+    if qb_page.url != search_url:
+        await qb_page.goto(search_url, wait_until="networkidle", timeout=20000)
+        await asyncio.sleep(2)
+
+    # Fill search input via JS (more reliable than wait_for_selector + click)
+    filled = await qb_page.evaluate(f"""
+        () => {{
+            const inputs = [...document.querySelectorAll('input')];
+            const inp = inputs.find(el =>
+                el.offsetParent !== null &&  // visible
+                (el.type === 'text' || el.type === 'search' || !el.type)
+            );
+            if (!inp) return false;
+            inp.value = {json.dumps(term)};
+            ['input','change'].forEach(ev =>
+                inp.dispatchEvent(new Event(ev, {{bubbles:true}})));
+            return true;
+        }}
+    """)
+
+    if not filled:
+        if debug:
+            print(f"    Could not find search input on {qb_page.url}")
+            await qb_page.screenshot(path=f"debug_search_{term[:8]}.png")
+        return []
+
+    await qb_page.keyboard.press("Enter")
+    await asyncio.sleep(5)  # wait for results to render
+
+    if debug:
+        await qb_page.screenshot(path=f"debug_results_{term[:8]}.png")
+
+    # Extract rows from the results table
+    rows = await qb_page.evaluate("""
+        () => {
+            // Try table rows first
+            const tableRows = document.querySelectorAll('table tbody tr, [class*="row"]:not(:first-child)');
+            if (tableRows.length > 0) {
+                return [...tableRows].map(row => {
+                    const cells = row.querySelectorAll('td, [class*="cell"]');
+                    const idText = cells[0]?.textContent?.trim() || '';
+                    // ID format is "1 - 2134" → extract the number after the dash
+                    const idMatch = idText.match(/\d+\s*-\s*(\d+)/) || idText.match(/(\d+)/);
+                    return {
+                        id:          idMatch ? idMatch[1] : null,
+                        subject:     cells[1]?.textContent?.trim() || null,
+                        system:      cells[2]?.textContent?.trim() || null,
+                        topic:       cells[3]?.textContent?.trim() || null,
+                        pct_correct: cells[4]?.textContent?.replace('%','').trim() || null,
+                    };
+                }).filter(r => r.id);
+            }
+            return [];
+        }
+    """)
+
+    if debug:
+        print(f"    DOM scrape: {len(rows)} rows")
+
+    # Clean up
+    results = []
+    for r in rows:
+        if not r.get("id"):
+            continue
+        pct = None
+        try:
+            pct = float(r["pct_correct"]) if r.get("pct_correct") else None
+        except (ValueError, TypeError):
+            pass
+        results.append({
+            "id":          str(r["id"]),
+            "subject":     r.get("subject") or None,
+            "system":      r.get("system")  or None,
+            "topic":       r.get("topic")   or None,
+            "pct_correct": pct,
+        })
+    return results
+
+
+# ─── PARSE API RESPONSE ───────────────────────────────────────────────────────
 
 def _parse_search_results(data):
-    """
-    Extract list of {id, subject, system, topic, pct_correct} from API response.
-    Handles multiple response shapes.
-    """
+    """Extract question records from any JSON shape."""
     results = []
 
-    def _extract_item(obj):
+    def _extract(obj):
         if not isinstance(obj, dict):
             return
-        # Try to get the question ID
         qid = (obj.get("id") or obj.get("qid") or obj.get("questionId")
                or obj.get("itemId") or obj.get("uwId"))
         if not qid:
             return
-        # Extract metadata
         subject = (obj.get("subject") or obj.get("subjectName")
                    or obj.get("discipline") or obj.get("disciplineName"))
         system  = (obj.get("system")  or obj.get("systemName")
@@ -454,8 +514,7 @@ def _parse_search_results(data):
         topic   = (obj.get("topic")   or obj.get("topicName")
                    or obj.get("concept") or obj.get("topicTitle"))
         pct     = (obj.get("percentCorrect") or obj.get("pctCorrect")
-                   or obj.get("correctPercent") or obj.get("percentCorrectGlobal")
-                   or obj.get("score") or obj.get("percent"))
+                   or obj.get("correctPercent") or obj.get("percentCorrectGlobal"))
         results.append({
             "id":          str(qid),
             "subject":     str(subject) if subject else None,
@@ -466,7 +525,7 @@ def _parse_search_results(data):
 
     def _walk(obj):
         if isinstance(obj, dict):
-            _extract_item(obj)
+            _extract(obj)
             for v in obj.values():
                 _walk(v)
         elif isinstance(obj, list):
@@ -477,111 +536,15 @@ def _parse_search_results(data):
     return results
 
 
-async def search_term(term: str, login_data: dict, debug: bool = False):
-    """
-    Call the search API with `term`, return list of question dicts.
-    Tries each candidate URL until one returns real data.
-    """
-    sub_id       = login_data["sub_id"]
-    discovered   = login_data.get("search_api")
-    headers      = _headers(login_data)
-    candidates   = _build_search_urls(term, sub_id, discovered)
-
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        for url in candidates:
-            try:
-                resp = await client.get(url, headers=headers)
-                if debug:
-                    print(f"    {resp.status_code}  {url[:90]}")
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
-                items = _parse_search_results(data)
-                if items:
-                    if debug:
-                        print(f"    → {len(items)} questions from {url[:70]}")
-                    # Record which URL worked
-                    login_data["search_api"] = url
-                    return items
-            except Exception as e:
-                if debug:
-                    print(f"    ERR {url[:70]}: {e}")
-    return []
-
-
-# ─── BROWSER FALLBACK SEARCH ─────────────────────────────────────────────────
-
-async def browser_search(term: str, login_data: dict,
-                          headless: bool = False, debug: bool = False):
-    """
-    If direct API calls fail, open the search page in a browser tab
-    (with saved cookies) and intercept the API call it makes.
-    """
-    from playwright.async_api import async_playwright
-
-    sub_id  = login_data["sub_id"]
-    cookies = login_data.get("cookies", [])
-    results_box = []
-
-    async def on_resp(resp):
-        if "json" not in resp.headers.get("content-type",""):
-            return
-        try:
-            body = await resp.json()
-            items = _parse_search_results(body)
-            if items and not results_box:
-                results_box.extend(items)
-                login_data["search_api"] = resp.url
-                if debug:
-                    print(f"    ✅ Intercepted search: {resp.url[:80]}")
-        except Exception:
-            pass
-
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless)
-        ctx     = await browser.new_context(viewport={"width":1280,"height":800})
-        if cookies:
-            await ctx.add_cookies(cookies)
-        page = await ctx.new_page()
-        page.on("response", on_resp)
-
-        search_url = f"{APPS_BASE}/search/{sub_id}/false"
-        await page.goto(search_url, wait_until="networkidle", timeout=20000)
-        await asyncio.sleep(2)
-
-        try:
-            inp = await page.wait_for_selector(
-                'input[type="text"], input[type="search"], '
-                'input[placeholder*="Question" i], input[placeholder*="search" i]',
-                timeout=8000
-            )
-            await inp.fill(term)
-            await asyncio.sleep(0.3)
-            await page.keyboard.press("Enter")
-            await asyncio.sleep(5)
-        except Exception as e:
-            print(f"    Search input error: {e}")
-
-        if debug:
-            await page.screenshot(path=f"debug_search_{term[:10]}.png")
-
-        await browser.close()
-
-    return results_box
-
-
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async def main():
     args = parse_args()
 
-    # ── Show stats only ──────────────────────────────────────────────────
     if args.show:
-        lib = load_library()
-        show_stats(lib)
+        show_stats(load_library())
         return
 
-    # ── Load or reset ────────────────────────────────────────────────────
     if args.fresh:
         LIBRARY_PATH.unlink(missing_ok=True)
         PROGRESS_PATH.unlink(missing_ok=True)
@@ -593,102 +556,106 @@ async def main():
     print(f"\n{'='*55}")
     print(f"  UWorld Library Builder")
     print(f"{'='*55}")
-    print(f"  Library so far: {len(lib)} questions")
-    print(f"  Terms completed: {len(progress['completed_terms'])}/{len(SEARCH_TERMS)}")
+    print(f"  Library so far:    {len(lib)} questions")
+    print(f"  Terms completed:   {len(progress['completed_terms'])}/{len(SEARCH_TERMS)}")
 
-    # ── Browser login ────────────────────────────────────────────────────
-    if not progress.get("sub_id") or not progress.get("api_endpoint") or args.fresh:
-        print(f"\n  🌐 Logging in to discover search API endpoint...")
-        login_data = await browser_login_and_discover(
-            headless=args.headless, debug=args.debug
-        )
-        progress["sub_id"]        = login_data["sub_id"]
-        progress["api_endpoint"]  = login_data.get("search_api")
-        progress["token"]         = login_data.get("token")
-        # Note: cookies expire, so we need a fresh login each session
-        save_progress(progress)
-    else:
-        # Still need fresh login for valid cookies/token
-        print(f"\n  🌐 Logging in (fresh cookies needed each session)...")
-        login_data = await browser_login_and_discover(
-            headless=args.headless, debug=args.debug
-        )
-        # Preserve known-good sub_id and endpoint from previous run
-        login_data["sub_id"] = progress["sub_id"]
-        if progress.get("api_endpoint") and not login_data.get("search_api"):
-            login_data["search_api"] = progress["api_endpoint"]
+    # ── Launch browser and login ──────────────────────────────────────────
+    print(f"\n  🌐 Opening browser{'(headless)' if args.headless else ''}...")
+    pw, browser, ctx = await launch_browser(args.headless)
 
-    sub_id = login_data["sub_id"]
-    print(f"\n  Subscription ID: {sub_id}")
-    print(f"  Search API:      {login_data.get('search_api') or '(will discover on first search)'}")
+    try:
+        # Attach subscription ID interceptor before login
+        sub_id_box = {}
+        async def on_any_resp(resp):
+            if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
+                try:
+                    sub_id_box[resp.url] = await resp.json()
+                except Exception:
+                    pass
 
-    # ── Search loop ───────────────────────────────────────────────────────
-    terms_to_run = [t for t in SEARCH_TERMS
-                    if t not in progress["completed_terms"]]
+        # Login
+        await login(ctx, args.debug)
 
-    print(f"\n  Running {len(terms_to_run)} search terms...\n")
+        # Wait for account API calls
+        for p in ctx.pages:
+            p.on("response", on_any_resp)
+        await asyncio.sleep(3)
 
-    for i, term in enumerate(terms_to_run):
-        before = len(lib)
+        # Find sub ID
+        sub_id = progress.get("sub_id")
+        if not sub_id:
+            # Parse from intercepted responses
+            all_subs = next((v for k, v in sub_id_box.items()
+                             if "GetAllSubscriptions" in k), None)
+            if all_subs and isinstance(all_subs, list):
+                for item in all_subs:
+                    if not isinstance(item, dict): continue
+                    if item.get("IsSim") or item.get("isSim"): continue
+                    if item.get("FormId") or item.get("formId"): continue
+                    name = str(item.get("CourseName") or "").lower()
+                    if any(x in name for x in ["self-assessment","free trial"]): continue
+                    sid = item.get("SubscriptionId") or item.get("subscriptionId")
+                    if sid:
+                        sub_id = str(sid)
+                        if args.debug:
+                            print(f"    QBank: {item.get('CourseName')} → {sid}")
+                        break
 
-        print(f"  [{i+1}/{len(terms_to_run)}] Searching: '{term}'")
+            if not sub_id:
+                # Parse sub IDs from URL patterns
+                ids = []
+                for url in sub_id_box:
+                    m = re.search(r'GetPaymentsForSubscription/(\d+)', url)
+                    if m: ids.append(m.group(1))
+                ids = sorted(set(ids), key=int)
+                sub_id = ids[1] if len(ids) > 1 else (ids[0] if ids else None)
 
-        # Try direct API first
-        items = await search_term(term, login_data, debug=args.debug)
+            if not sub_id:
+                raise RuntimeError("Could not find subscription ID.")
 
-        # Fall back to browser if API returned nothing
-        if not items:
-            print(f"    API returned nothing — trying browser fallback...")
-            items = await browser_search(
-                term, login_data,
-                headless=args.headless,
-                debug=args.debug
-            )
+            progress["sub_id"] = sub_id
+            save_progress(progress)
 
-        # Merge into library (don't overwrite existing entries that have more data)
-        new_this_term = 0
-        for q in items:
-            qid = q["id"]
-            if qid not in lib:
-                lib[qid] = q
-                new_this_term += 1
-            else:
-                # Enrich existing entry if new data has more fields filled in
-                existing = lib[qid]
-                for field in ["subject","system","topic","pct_correct"]:
-                    if not existing.get(field) and q.get(field):
-                        existing[field] = q[field]
+        print(f"\n  📋 Subscription ID: {sub_id}")
 
-        after = len(lib)
-        print(f"    → {len(items)} results, {new_this_term} new IDs  "
-              f"(library total: {after})")
+        # ── Enter the qbank ───────────────────────────────────────────────
+        qb_page = await enter_qbank(ctx, sub_id, args.debug)
 
-        # Save after every term
-        save_library(lib)
-        progress["completed_terms"].append(term)
-        progress["api_endpoint"] = login_data.get("search_api")
-        save_progress(progress)
+        # ── Search loop ───────────────────────────────────────────────────
+        terms_to_run = [t for t in SEARCH_TERMS
+                        if t not in progress["completed_terms"]]
+        print(f"\n  Running {len(terms_to_run)} search terms...\n")
 
-        # Stop early if no new IDs for last 5 terms
-        if i >= 4:
-            recent = [t for t in progress["completed_terms"][-5:]]
-            # (would need per-term new count to implement precisely — skip for now)
+        for i, term in enumerate(terms_to_run):
+            print(f"  [{i+1}/{len(terms_to_run)}] '{term}'")
+            items = await search_in_browser(qb_page, sub_id, term, args.debug)
 
-        await asyncio.sleep(0.5)  # be polite
+            new_this = 0
+            for q in items:
+                qid = q["id"]
+                if qid not in lib:
+                    lib[qid] = q
+                    new_this += 1
+                else:
+                    for f in ["subject","system","topic","pct_correct"]:
+                        if not lib[qid].get(f) and q.get(f):
+                            lib[qid][f] = q[f]
+
+            print(f"    {len(items)} results, {new_this} new  (total: {len(lib)})")
+            save_library(lib)
+            progress["completed_terms"].append(term)
+            save_progress(progress)
+            await asyncio.sleep(0.3)
+
+    finally:
+        await browser.close()
+        await pw.stop()
 
     # ── Final stats ───────────────────────────────────────────────────────
     print(f"\n{'='*55}")
-    print(f"  Done! Library contains {len(lib)} unique questions.")
+    print(f"  Done! {len(lib)} questions in library.")
     print(f"  Saved to: {LIBRARY_PATH}")
     show_stats(lib)
-
-    # Check for questions with missing metadata
-    missing_topic   = sum(1 for q in lib.values() if not q.get("topic"))
-    missing_system  = sum(1 for q in lib.values() if not q.get("system"))
-    if missing_topic or missing_system:
-        print(f"\n  ⚠️  Missing topic:  {missing_topic} questions")
-        print(f"  ⚠️  Missing system: {missing_system} questions")
-        print(f"  Run again with different search terms to fill gaps.")
 
 
 if __name__ == "__main__":
