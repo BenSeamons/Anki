@@ -159,68 +159,8 @@ async def run(args):
             headless=args.headless,
             args=["--disable-blink-features=AutomationControlled"]
         )
-
-        # ── Login context — NO stealth script, plain browser ──────────────
-        # Stealth patches interfere with AngularJS form events on the login page.
-        login_ctx = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-
-        sub_id_box = {}
-        async def capture_subs(resp):
-            if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
-                try: sub_id_box[resp.url] = await resp.json()
-                except Exception: pass
-
-        page = await login_ctx.new_page()
-        page.on("response", capture_subs)
-
-        print("  🔐 Logging in...")
-        await page.goto("https://www.uworld.com/app/index.html#/login/",
-                        wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-
-        # Use Playwright's native fill() — more reliable than JS, handles Angular
-        try:
-            await page.wait_for_selector("#login-email", timeout=12000)
-            await page.locator("#login-email").fill(email)
-        except Exception:
-            await page.wait_for_selector('input[type="email"]', timeout=5000)
-            await page.locator('input[type="email"]').fill(email)
-        await asyncio.sleep(0.3)
-        await page.locator('#login-password').fill(password)
-        await asyncio.sleep(0.4)
-
-        # Click submit
-        try:
-            await page.locator('button[type="submit"]').click()
-        except Exception:
-            await page.keyboard.press("Enter")
-
-        try: await page.wait_for_function("!window.location.hash.includes('login')", timeout=25000)
-        except Exception: pass
-        await asyncio.sleep(3)
-
-        if "login" in (await page.evaluate("window.location.hash")).lower():
-            if args.debug:
-                await page.screenshot(path="debug_login_failed.png")
-            raise RuntimeError(
-                "Login failed — UWorld rejected credentials or blocked the IP.\n"
-                "Try manually logging in at uworld.com first to verify your account isn't locked."
-            )
-        print(f"  ✅ Logged in!")
-        if args.debug: await page.screenshot(path="debug_01_loggedin.png")
-
-        # Transfer cookies from login context to the qbank context
-        cookies = await login_ctx.cookies()
-        await login_ctx.close()
-
-        # ── QBank context — WITH stealth patches ─────────────────────────
+        # ONE context for everything — stealth applied, native Playwright
+        # fill() handles Angular forms fine regardless of stealth patches.
         ctx = await browser.new_context(
             viewport={"width": 1280, "height": 900},
             user_agent=(
@@ -232,7 +172,50 @@ async def run(args):
             timezone_id="America/New_York",
         )
         await ctx.add_init_script(STEALTH_SCRIPT)
-        await ctx.add_cookies(cookies)  # carry login session over
+
+        sub_id_box = {}
+        async def capture_subs(resp):
+            if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
+                try: sub_id_box[resp.url] = await resp.json()
+                except Exception: pass
+
+        page = await ctx.new_page()
+        page.on("response", capture_subs)
+
+        # ── Login ─────────────────────────────────────────────────────────
+        print("  🔐 Logging in...")
+        await page.goto("https://www.uworld.com/app/index.html#/login/",
+                        wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2)
+
+        try: await page.wait_for_selector("#login-email", timeout=12000)
+        except Exception: await page.wait_for_selector('input[type="email"]', timeout=5000)
+
+        # Native fill() — reliable regardless of overlays or stealth patches
+        await page.locator("#login-email").fill(email)
+        await asyncio.sleep(0.3)
+        await page.locator("#login-password").fill(password)
+        await asyncio.sleep(0.4)
+
+        # Click submit — force=True bypasses the navbar overlay issue
+        try:
+            await page.locator('button[type="submit"]').click(force=True)
+        except Exception:
+            await page.evaluate("document.querySelector('button[type=\"submit\"]').click()")
+
+        try: await page.wait_for_function(
+            "!window.location.hash.includes('login')", timeout=25000)
+        except Exception: pass
+        await asyncio.sleep(3)
+
+        if "login" in (await page.evaluate("window.location.hash")).lower():
+            if args.debug: await page.screenshot(path="debug_login_failed.png")
+            raise RuntimeError(
+                "Login failed — check UWORLD_EMAIL / UWORLD_PASSWORD in .env\n"
+                "or try logging in manually first to confirm account isn't locked."
+            )
+        print(f"  ✅ Logged in!")
+        if args.debug: await page.screenshot(path="debug_01_loggedin.png")
 
         # ── Find subscription ID ──────────────────────────────────────────
         await asyncio.sleep(2)
@@ -249,84 +232,92 @@ async def run(args):
                     if sid: sub_id = str(sid); break
             if not sub_id:
                 ids = sorted({re.search(r'GetPaymentsForSubscription/(\d+)', u).group(1)
-                              for u in sub_id_box if re.search(r'GetPaymentsForSubscription/(\d+)',u)},
-                             key=int)
+                              for u in sub_id_box
+                              if re.search(r'GetPaymentsForSubscription/(\d+)', u)}, key=int)
                 sub_id = ids[1] if len(ids) > 1 else (ids[0] if ids else None)
             if not sub_id: raise RuntimeError("Could not find subscription ID.")
             progress["sub_id"] = sub_id
             save_progress(progress)
         print(f"  📋 Subscription ID: {sub_id}")
 
+        # ── Navigate into the qbank via Launch button ─────────────────────
+        # This is the critical step — clicking Launch (or following its href)
+        # triggers the auth handoff that sets apps.uworld.com cookies.
+        print("  🚀 Launching qbank...")
+        qb_page = None
+
+        # Strategy 1: get the href directly and navigate to it
+        launch_href = await page.evaluate(
+            "() => { const b=[...document.querySelectorAll('a,button')]"
+            ".find(e=>/launch/i.test(e.textContent));"
+            " return b&&b.href?b.href:null; }"
+        )
+        if launch_href and "apps.uworld.com" in launch_href:
+            qb_page = await ctx.new_page()
+            await qb_page.goto(launch_href, wait_until="domcontentloaded", timeout=25000)
+            await asyncio.sleep(4)
+            if args.debug:
+                await qb_page.screenshot(path="debug_02_qbank.png")
+                print(f"     qbank URL: {qb_page.url}")
+
+        # Strategy 2: click Launch and catch the new tab
+        if not qb_page or "apps.uworld.com" not in qb_page.url:
+            try:
+                async with ctx.expect_page(timeout=8000) as pg_info:
+                    await page.evaluate(
+                        "() => { const b=[...document.querySelectorAll('a,button')]"
+                        ".find(e=>/launch/i.test(e.textContent)); if(b)b.click(); }"
+                    )
+                qb_page = await pg_info.value
+                await qb_page.wait_for_load_state("domcontentloaded", timeout=20000)
+                await asyncio.sleep(4)
+                if args.debug:
+                    await qb_page.screenshot(path="debug_02_qbank.png")
+                    print(f"     qbank URL: {qb_page.url}")
+            except Exception as e:
+                if args.debug: print(f"     Launch click: {e}")
+
+        # Strategy 3: direct navigation (last resort)
+        if not qb_page or "apps.uworld.com" not in qb_page.url:
+            if args.debug: print("     Falling back to direct navigation")
+            qb_page = await ctx.new_page()
+            await qb_page.goto(f"{APPS_BASE}/dashboard/{sub_id}",
+                               wait_until="domcontentloaded", timeout=25000)
+            await asyncio.sleep(4)
+
+        if args.debug: print(f"  In qbank: {qb_page.url}")
+
         # ── Open search page ──────────────────────────────────────────────
         search_url = f"{APPS_BASE}/search/{sub_id}/false"
-
-        # Try launching properly through the account page first
-        # (sets auth cookies for apps.uworld.com)
-        try:
-            launch_href = await page.evaluate("""() => {
-                const a=[...document.querySelectorAll('a,button')];
-                const btn=a.find(el=>/launch/i.test(el.textContent));
-                return btn?.href||null;
-            }""")
-            if launch_href and "apps.uworld.com" in launch_href:
-                sp = await ctx.new_page()
-                await sp.goto(launch_href, wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(3)
-                if args.debug: await sp.screenshot(path="debug_02_launched.png")
-            else:
-                raise Exception("no href, trying click")
-        except Exception:
-            try:
-                async with ctx.expect_page(timeout=6000) as pg_info:
-                    await page.evaluate("""() => {
-                        const btn=[...document.querySelectorAll('a,button')]
-                            .find(el=>/launch/i.test(el.textContent));
-                        if(btn)btn.click();
-                    }""")
-                launched_page = await pg_info.value
-                await launched_page.wait_for_load_state("domcontentloaded", timeout=15000)
-                await asyncio.sleep(3)
-                if args.debug: await launched_page.screenshot(path="debug_02_launched.png")
-            except Exception:
-                # Direct navigation — works once apps.uworld.com is in context
-                sp = await ctx.new_page()
-                await sp.goto(f"{APPS_BASE}/dashboard/{sub_id}",
-                              wait_until="domcontentloaded", timeout=20000)
-                await asyncio.sleep(3)
-
-        # Now open the actual search page
-        qb_page = await ctx.new_page()
         print(f"  🔍 Opening search page...")
         await qb_page.goto(search_url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(5)  # give Angular time to fully init
+        await asyncio.sleep(6)  # Angular needs time to fully initialize
 
         if args.debug:
             await qb_page.screenshot(path="debug_03_search_page.png")
             print(f"     URL: {qb_page.url}")
 
-        # Inspect what inputs exist on the page
-        all_inputs = await qb_page.evaluate("""() => [...document.querySelectorAll('input')].map(el=>({
-            type: el.type, placeholder: el.placeholder, id: el.id,
-            name: el.name, visible: el.offsetParent!==null,
-            class: el.className.substring(0,60)
-        }))""")
+        # Report all inputs found — critical for debugging
+        all_inputs = await qb_page.evaluate(
+            "() => [...document.querySelectorAll('input')].map(el=>({"
+            "type:el.type,placeholder:el.placeholder,id:el.id,"
+            "name:el.name,visible:el.offsetParent!==null,"
+            "cls:el.className.substring(0,50)}))"
+        )
         if args.debug:
-            print(f"     Inputs found on page ({len(all_inputs)}):")
-            for inp in all_inputs:
-                print(f"       {inp}")
+            print(f"     Inputs found: {len(all_inputs)}")
+            for inp in all_inputs: print(f"       {inp}")
+        elif len(all_inputs) == 0:
+            print("  ⚠️  No inputs found on search page — page may not be authenticated.")
+            print("     Run with --debug and check debug_03_search_page.png")
 
-        # Dismiss any overlay/warning modal UWorld might show
-        await qb_page.evaluate("""() => {
-            // close any modal/warning dialogs
-            document.querySelectorAll(
-                '[class*="modal"] [class*="close"], [class*="dialog"] button, '
-                '[class*="alert"] button, [class*="warning"] button, '
-                'button[aria-label*="close" i], button[aria-label*="dismiss" i]'
-            ).forEach(b=>b.click());
-            // remove overlay divs that might be blocking input
-            document.querySelectorAll('[class*="overlay"],[class*="backdrop"]')
-                .forEach(el=>{ if(el.style) el.style.pointerEvents='none'; });
-        }""")
+        # Dismiss any modal/overlay (one-liner JS, no string concatenation issues)
+        await qb_page.evaluate(
+            "() => { document.querySelectorAll('[class*=modal] button,[class*=dialog] button,"
+            "[class*=alert] button').forEach(b=>b.click());"
+            " document.querySelectorAll('[class*=overlay],[class*=backdrop]')"
+            ".forEach(el=>{if(el.style)el.style.pointerEvents='none';}); }"
+        )
         await asyncio.sleep(1)
 
         # ── Set up response interceptor on the search page ────────────────
