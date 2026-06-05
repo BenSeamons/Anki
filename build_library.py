@@ -197,11 +197,19 @@ async def run(args):
         await page.locator("#login-password").fill(password)
         await asyncio.sleep(0.4)
 
-        # Click submit — force=True bypasses the navbar overlay issue
+        # Click submit — force=True bypasses the navbar overlay issue.
+        # Ignore any exception (page may have already navigated away on success).
         try:
             await page.locator('button[type="submit"]').click(force=True)
         except Exception:
-            await page.evaluate("document.querySelector('button[type=\"submit\"]').click()")
+            pass  # if force click raised but page navigated, we're fine
+        # Fallback: if still on login page, try keyboard Enter
+        await asyncio.sleep(1)
+        try:
+            if "login" in (await page.evaluate("window.location.hash")).lower():
+                await page.keyboard.press("Enter")
+        except Exception:
+            pass
 
         try: await page.wait_for_function(
             "!window.location.hash.includes('login')", timeout=25000)
