@@ -182,41 +182,34 @@ async def run(args):
         try: await page.wait_for_selector("#login-email", timeout=12000)
         except Exception: await page.wait_for_selector('input[type="email"]', timeout=5000)
 
-        # Fill credentials using JS directly — this is what worked reliably
-        # before. Playwright's fill() fires 'input' but AngularJS also needs
-        # 'change' and 'blur' to update its ng-model binding.
-        await page.evaluate("""([em, pw]) => {
-            function fill(el, val) {
-                if (!el) return;
-                el.value = val;
-                el.dispatchEvent(new Event('input',  {bubbles:true}));
-                el.dispatchEvent(new Event('change', {bubbles:true}));
-                el.dispatchEvent(new Event('blur',   {bubbles:true}));
-            }
-            fill(document.getElementById('login-email'), em);
-            fill(document.getElementById('login-password'), pw);
-        }""", [email, password])
-        await asyncio.sleep(0.5)
+        # Accept cookie consent banner — UWorld may require this for auth to work
+        try:
+            await page.locator("text=Allow All").click(timeout=3000)
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+        # Focus email field via JS (avoids navbar overlay click issue),
+        # then type real keystrokes — this is the most human-like approach
+        # and hardest for UWorld's bot detection to flag.
+        await page.evaluate("() => document.getElementById('login-email').focus()")
+        await asyncio.sleep(0.2)
+        await page.keyboard.type(email, delay=60)
+        await asyncio.sleep(0.3)
+
+        # Tab to password field, then type password
+        await page.keyboard.press("Tab")
+        await asyncio.sleep(0.2)
+        await page.keyboard.type(password, delay=60)
+        await asyncio.sleep(0.4)
 
         if args.debug:
             await page.screenshot(path="debug_01b_pre_submit.png")
-            print("     Saved debug_01b_pre_submit.png — check fields are filled")
+            print("     Saved debug_01b_pre_submit.png")
 
-        # Click submit via JS — Playwright click has overlay issues, JS click does not
-        await page.evaluate(
-            "() => { const b = document.getElementById('login-submit')"
-            " || document.querySelector('button[type=submit]')"
-            " || [...document.querySelectorAll('button')]"
-            ".find(b => /login|sign in/i.test(b.textContent));"
-            " if (b) b.click(); }"
-        )
+        # Submit with Enter (most natural form submission)
+        await page.keyboard.press("Enter")
         await asyncio.sleep(1)
-        # If still on login page, try Enter as backup
-        try:
-            if "login" in (await page.evaluate("window.location.hash")).lower():
-                await page.keyboard.press("Enter")
-        except Exception:
-            pass
 
         try: await page.wait_for_function(
             "!window.location.hash.includes('login')", timeout=25000)
@@ -264,51 +257,58 @@ async def run(args):
         print(f"  📋 Subscription ID: {sub_id}")
 
         # ── Navigate into the qbank via Launch button ─────────────────────
-        # This is the critical step — clicking Launch (or following its href)
-        # triggers the auth handoff that sets apps.uworld.com cookies.
+        # CRITICAL: must click Launch from the account page so the browser
+        # follows the auth redirect that sets apps.uworld.com session cookies.
+        # Direct navigation gets a blank page because those cookies are missing.
         print("  🚀 Launching qbank...")
         qb_page = None
 
-        # Strategy 1: get the href directly and navigate to it
-        launch_href = await page.evaluate(
-            "() => { const b=[...document.querySelectorAll('a,button')]"
-            ".find(e=>/launch/i.test(e.textContent));"
-            " return b&&b.href?b.href:null; }"
-        )
-        if launch_href and "apps.uworld.com" in launch_href:
-            qb_page = await ctx.new_page()
-            await qb_page.goto(launch_href, wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(4)
+        # Strategy 1: click Launch, capture the new tab it opens
+        try:
+            async with ctx.expect_page(timeout=10000) as pg_info:
+                # Use JS click (bypasses any overlay on the Launch button)
+                await page.evaluate(
+                    "() => { const all=[...document.querySelectorAll('a,button')];"
+                    " const med=all.find(e=>{ if(!/launch/i.test(e.textContent))return false;"
+                    " const row=e.closest('tr,li,div');return !row||/step|ck|qbank|medical/i.test(row.textContent);});"
+                    " const btn=med||all.find(e=>/launch/i.test(e.textContent));"
+                    " if(btn)btn.click(); }"
+                )
+            qb_page = await pg_info.value
+            await qb_page.wait_for_load_state("networkidle", timeout=25000)
+            await asyncio.sleep(3)
             if args.debug:
                 await qb_page.screenshot(path="debug_02_qbank.png")
-                print(f"     qbank URL: {qb_page.url}")
+                print(f"     qbank: {qb_page.url}")
+        except Exception as e:
+            if args.debug: print(f"     Launch new-tab: {e}")
 
-        # Strategy 2: click Launch and catch the new tab
+        # Strategy 2: navigate the current page to the launch href
         if not qb_page or "apps.uworld.com" not in qb_page.url:
-            try:
-                async with ctx.expect_page(timeout=8000) as pg_info:
-                    await page.evaluate(
-                        "() => { const b=[...document.querySelectorAll('a,button')]"
-                        ".find(e=>/launch/i.test(e.textContent)); if(b)b.click(); }"
-                    )
-                qb_page = await pg_info.value
-                await qb_page.wait_for_load_state("domcontentloaded", timeout=20000)
-                await asyncio.sleep(4)
-                if args.debug:
-                    await qb_page.screenshot(path="debug_02_qbank.png")
-                    print(f"     qbank URL: {qb_page.url}")
-            except Exception as e:
-                if args.debug: print(f"     Launch click: {e}")
+            launch_href = await page.evaluate(
+                "() => { const b=[...document.querySelectorAll('a,button')]"
+                ".find(e=>/launch/i.test(e.textContent));"
+                " return b&&b.href?b.href:null; }"
+            )
+            if launch_href and "uworld.com" in launch_href:
+                await page.goto(launch_href, wait_until="networkidle", timeout=25000)
+                await asyncio.sleep(3)
+                if "apps.uworld.com" in page.url:
+                    qb_page = page
+                    if args.debug: print(f"     qbank (same tab): {qb_page.url}")
 
-        # Strategy 3: direct navigation (last resort)
+        # Strategy 3: direct navigation — may get a blank page if auth didn't transfer
         if not qb_page or "apps.uworld.com" not in qb_page.url:
-            if args.debug: print("     Falling back to direct navigation")
+            print("  ⚠️  Could not launch via button — trying direct navigation")
             qb_page = await ctx.new_page()
             await qb_page.goto(f"{APPS_BASE}/dashboard/{sub_id}",
-                               wait_until="domcontentloaded", timeout=25000)
-            await asyncio.sleep(4)
+                               wait_until="networkidle", timeout=25000)
+            await asyncio.sleep(5)
+            if args.debug:
+                await qb_page.screenshot(path="debug_02_qbank_direct.png")
+                print(f"     direct nav: {qb_page.url}")
 
-        if args.debug: print(f"  In qbank: {qb_page.url}")
+        if args.debug: print(f"  In qbank: {qb_page.url if qb_page else 'none'}")
 
         # ── Open search page ──────────────────────────────────────────────
         search_url = f"{APPS_BASE}/search/{sub_id}/false"
