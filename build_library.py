@@ -55,16 +55,7 @@ if (!window.chrome) {
     };
 }
 
-// 3. Fix permissions (Playwright returns 'denied' for notifications)
-const _origQuery = window.navigator.permissions && window.navigator.permissions.query;
-if (_origQuery) {
-    window.navigator.permissions.query = (p) =>
-        p.name === 'notifications'
-            ? Promise.resolve({state: Notification.permission})
-            : _origQuery.call(window.navigator.permissions, p);
-}
-
-// 4. Add fake plugins so navigator.plugins isn't empty
+// 3. Add fake plugins so navigator.plugins isn't empty
 Object.defineProperty(navigator, 'plugins', {
     get: () => [
         {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer'},
@@ -191,20 +182,36 @@ async def run(args):
         try: await page.wait_for_selector("#login-email", timeout=12000)
         except Exception: await page.wait_for_selector('input[type="email"]', timeout=5000)
 
-        # Native fill() — reliable regardless of overlays or stealth patches
-        await page.locator("#login-email").fill(email)
-        await asyncio.sleep(0.3)
-        await page.locator("#login-password").fill(password)
-        await asyncio.sleep(0.4)
+        # Fill credentials using JS directly — this is what worked reliably
+        # before. Playwright's fill() fires 'input' but AngularJS also needs
+        # 'change' and 'blur' to update its ng-model binding.
+        await page.evaluate("""([em, pw]) => {
+            function fill(el, val) {
+                if (!el) return;
+                el.value = val;
+                el.dispatchEvent(new Event('input',  {bubbles:true}));
+                el.dispatchEvent(new Event('change', {bubbles:true}));
+                el.dispatchEvent(new Event('blur',   {bubbles:true}));
+            }
+            fill(document.getElementById('login-email'), em);
+            fill(document.getElementById('login-password'), pw);
+        }""", [email, password])
+        await asyncio.sleep(0.5)
 
-        # Click submit — force=True bypasses the navbar overlay issue.
-        # Ignore any exception (page may have already navigated away on success).
-        try:
-            await page.locator('button[type="submit"]').click(force=True)
-        except Exception:
-            pass  # if force click raised but page navigated, we're fine
-        # Fallback: if still on login page, try keyboard Enter
+        if args.debug:
+            await page.screenshot(path="debug_01b_pre_submit.png")
+            print("     Saved debug_01b_pre_submit.png — check fields are filled")
+
+        # Click submit via JS — Playwright click has overlay issues, JS click does not
+        await page.evaluate(
+            "() => { const b = document.getElementById('login-submit')"
+            " || document.querySelector('button[type=submit]')"
+            " || [...document.querySelectorAll('button')]"
+            ".find(b => /login|sign in/i.test(b.textContent));"
+            " if (b) b.click(); }"
+        )
         await asyncio.sleep(1)
+        # If still on login page, try Enter as backup
         try:
             if "login" in (await page.evaluate("window.location.hash")).lower():
                 await page.keyboard.press("Enter")
@@ -216,11 +223,19 @@ async def run(args):
         except Exception: pass
         await asyncio.sleep(3)
 
-        if "login" in (await page.evaluate("window.location.hash")).lower():
-            if args.debug: await page.screenshot(path="debug_login_failed.png")
+        current_hash = await page.evaluate("window.location.hash")
+        if "login" in current_hash.lower():
+            await page.screenshot(path="debug_login_failed.png")  # always save
+            # Check for error message on the page
+            err_text = await page.evaluate(
+                "() => document.querySelector('[class*=error],[class*=alert],"
+                "[class*=message]')?.textContent?.trim() || '(no error text found)'"
+            )
             raise RuntimeError(
-                "Login failed — check UWORLD_EMAIL / UWORLD_PASSWORD in .env\n"
-                "or try logging in manually first to confirm account isn't locked."
+                f"Login failed. Page error: {err_text}\n"
+                "Check debug_login_failed.png to see the login page state.\n"
+                "If you see 'Unable to authenticate', try logging into uworld.com\n"
+                "manually first — the account may be temporarily rate-limited."
             )
         print(f"  ✅ Logged in!")
         if args.debug: await page.screenshot(path="debug_01_loggedin.png")
