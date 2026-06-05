@@ -193,7 +193,7 @@ async def run(args):
             await page.wait_for_selector('input[type="email"]', timeout=5000)
             await page.locator('input[type="email"]').fill(email)
         await asyncio.sleep(0.3)
-        await page.locator('input[type="password"]').fill(password)
+        await page.locator('#login-password').fill(password)
         await asyncio.sleep(0.4)
 
         # Click submit
