@@ -95,14 +95,20 @@ def parse_questions(data):
     results = []
     def _ex(obj):
         if not isinstance(obj, dict): return
-        qid = (obj.get("id") or obj.get("qid") or obj.get("questionId")
-               or obj.get("itemId") or obj.get("uwId"))
+        # UWorld API field: questionIndex (from GetQuestionAttributesByIndexOrText)
+        qid = (obj.get("questionIndex") or obj.get("id") or obj.get("qid")
+               or obj.get("questionId") or obj.get("itemId") or obj.get("uwId")
+               or obj.get("index") or obj.get("questionNumber"))
         if not qid: return
-        subject = obj.get("subject") or obj.get("subjectName") or obj.get("discipline")
-        system  = obj.get("system")  or obj.get("systemName")  or obj.get("bodySystem")
-        topic   = obj.get("topic")   or obj.get("topicName")   or obj.get("concept")
-        pct     = (obj.get("percentCorrect") or obj.get("pctCorrect")
-                   or obj.get("correctPercent") or obj.get("percentCorrectGlobal"))
+        # UWorld API: superDivisionName=Subject, subDivisionName=System, topicName=Topic
+        subject = (obj.get("superDivisionName") or obj.get("subject")
+                   or obj.get("subjectName") or obj.get("discipline"))
+        system  = (obj.get("subDivisionName") or obj.get("system")
+                   or obj.get("systemName")  or obj.get("bodySystem"))
+        topic   = (obj.get("topicName") or obj.get("topic") or obj.get("concept"))
+        pct     = (obj.get("correctPercentile") or obj.get("percentCorrect")
+                   or obj.get("pctCorrect") or obj.get("correctPercent")
+                   or obj.get("percentCorrectGlobal"))
         results.append({
             "id":          str(qid),
             "subject":     str(subject) if subject else None,
@@ -448,23 +454,36 @@ async def run(args):
             print(f"  [SEARCH] All inputs: {json.dumps(all_inp)}")
 
         # ── RESPONSE INTERCEPTOR ───────────────────────────────────────────
+        recent_json_urls = []
+        first_body_logged = {"done": False}
+
         async def on_search_resp(resp):
             ct  = resp.headers.get("content-type", "")
             url = resp.url
             if "json" not in ct: return
-            if not any(x in url for x in
-                       ["gateway-api","search","question","item","qbank",
-                        "GetQuestions","GetItems","GetSearch","Search"]):
-                return
+            if args.debug:
+                recent_json_urls.append(url)
+            # Catch any JSON endpoint that might have question data
+            suspect = any(x in url.lower() for x in
+                          ["gateway-api", "search", "question", "item", "qbank",
+                           "getquestions", "getitems", "getsearch", "keyword",
+                           "filter", "uworld", "apps.uworld"])
+            if not suspect: return
             try:
                 body  = await resp.json()
+                # Log first response body in debug mode to understand structure
+                if args.debug and not first_body_logged["done"]:
+                    first_body_logged["done"] = True
+                    body_str = json.dumps(body)[:800]
+                    print(f"\n       [RAW] {url[:80]}\n       {body_str}\n")
                 items = parse_questions(body)
                 if items:
                     captured_items.extend(items)
                     if args.debug:
-                        print(f"       [API] {len(items)} Qs <- {url[:80]}")
-            except Exception:
-                pass
+                        print(f"       [API] {len(items)} Qs <- {url[:100]}")
+            except Exception as ex:
+                if args.debug:
+                    print(f"       [ERR] {url[:80]}: {ex}")
 
         qb_page.on("response", on_search_resp)
 
@@ -477,6 +496,9 @@ async def run(args):
         }""")
         await asyncio.sleep(0.5)
 
+        # Find the search input locator
+        search_input = qb_page.locator("input[type=text], input[type=search], input:not([type=hidden])")
+
         # ── SEARCH LOOP ────────────────────────────────────────────────────
         terms_to_run = [t for t in SEARCH_TERMS if t not in progress["completed_terms"]]
         print(f"\n  Running {len(terms_to_run)} search terms...\n")
@@ -484,31 +506,41 @@ async def run(args):
         for i, term in enumerate(terms_to_run):
             print(f"  [{i+1}/{len(terms_to_run)}] '{term}'", end=" ", flush=True)
             captured_items.clear()
+            recent_json_urls.clear()
 
-            filled = await qb_page.evaluate(f"""() => {{
-                const candidates = [
-                    ...document.querySelectorAll('input[type=text]'),
-                    ...document.querySelectorAll('input[type=search]'),
-                    ...document.querySelectorAll('input:not([type=hidden])'),
-                ];
-                const inp = candidates.find(el => el.offsetParent !== null) || candidates[0];
-                if (!inp) return false;
-                inp.focus();
-                inp.value = {json.dumps(term)};
-                ['focus','input','change'].forEach(ev =>
-                    inp.dispatchEvent(new Event(ev, {{bubbles:true}})));
-                ['keydown','keypress','keyup'].forEach(ev =>
-                    inp.dispatchEvent(new KeyboardEvent(ev,
-                        {{key:'Enter',keyCode:13,bubbles:true}})));
-                return inp.placeholder || inp.id || inp.name || '(found)';
-            }}""")
+            try:
+                # Use Playwright's fill() — properly triggers Angular's ngModel/FormControl
+                visible_inp = search_input.first
+                await visible_inp.click(timeout=5000)
+                await visible_inp.fill(term, timeout=5000)
+                await asyncio.sleep(0.3)
+                await qb_page.keyboard.press("Enter")
+            except Exception as e:
+                # Fallback: JS injection with Angular-compatible events
+                if args.debug: print(f"\n       [WARN] fill failed ({e}), JS fallback")
+                await qb_page.evaluate(f"""() => {{
+                    const inp = [...document.querySelectorAll('input')]
+                        .find(el => el.offsetParent !== null);
+                    if (!inp) return;
+                    inp.focus();
+                    const nativeInputSetter = Object.getOwnPropertyDescriptor(
+                        window.HTMLInputElement.prototype, 'value').set;
+                    nativeInputSetter.call(inp, {json.dumps(term)});
+                    inp.dispatchEvent(new Event('input', {{bubbles:true}}));
+                    inp.dispatchEvent(new KeyboardEvent('keydown',
+                        {{key:'Enter',keyCode:13,bubbles:true}}));
+                    inp.dispatchEvent(new KeyboardEvent('keyup',
+                        {{key:'Enter',keyCode:13,bubbles:true}}));
+                }}""")
+                await qb_page.keyboard.press("Enter")
 
-            await qb_page.keyboard.press("Enter")
-            await asyncio.sleep(6)
+            # Wait for API response (up to 8 seconds)
+            await asyncio.sleep(8)
 
             if args.debug:
                 await qb_page.screenshot(path=f"debug_search_{term[:10]}.png")
-                print(f"\n       filled: {filled}")
+                if recent_json_urls:
+                    print(f"\n       [URLS] JSON responses: {recent_json_urls[:5]}")
 
             new_this = 0
             for q in captured_items:
@@ -525,12 +557,11 @@ async def run(args):
             progress["completed_terms"].append(term)
             save_progress(progress)
 
-            # Clear input for next term
-            await qb_page.evaluate("""() => {
-                const inp = document.querySelector(
-                    'input[type=text],input[type=search],input:not([type=hidden])');
-                if (inp){ inp.value=''; inp.dispatchEvent(new Event('input',{bubbles:true})); }
-            }""")
+            # Clear input for next term using fill('')
+            try:
+                await search_input.first.fill("", timeout=3000)
+            except Exception:
+                pass
             await asyncio.sleep(0.5)
 
         await ctx.close()
