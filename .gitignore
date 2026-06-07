@@ -30,3 +30,10 @@ README (*).md
 # Build artifacts
 dist/
 build/
+
+# UWorld library builder artifacts
+uworld_chrome_profile/
+uworld_pw_profile/
+build_library_run.log
+uworld_library.json
+uworld_library_progress.json

@@ -1,80 +1,65 @@
 #!/usr/bin/env python3
 """
-build_library.py — Build a local UWorld question library (ID → Subject/System/Topic).
+build_library.py — Build a local UWorld question library (ID -> Subject/System/Topic).
 
-Strategy:
-  1. Log in with stealth patches so UWorld doesn't detect automation.
-  2. Navigate to the Search page inside the qbank.
-  3. Type search terms into the input via JS and capture the API responses
-     the Angular app itself fires (no fetch() calls — no CORS issues).
-  4. Save incrementally to uworld_library.json.
+AUTH STRATEGY — Persistent Chrome Profile:
+  - Uses launch_persistent_context() with a saved profile directory.
+  - First run: tries automated login; if reCAPTCHA blocks it, waits for
+    the user to log in manually in the visible browser window. The user
+    only needs to do this ONCE — the session is saved in the profile.
+  - Subsequent runs: profile already has valid session cookies → no login needed.
+
+SEARCH STRATEGY:
+  - Navigates to apps.uworld.com/search via the Launch button.
+  - Intercepts gateway-api.uworld.com JSON responses (avoids CORS issues).
+  - Types 65 search terms, captures question ID → Subject/System/Topic mappings.
+  - Saves incrementally after each term.
 
 RUN:
-    python build_library.py              # full run
-    python build_library.py --headless   # no visible browser (may trigger detection)
-    python build_library.py --fresh      # wipe and start over
-    python build_library.py --show       # print stats and exit
-    python build_library.py --debug      # save screenshots at each step
+    python build_library.py              # resume where you left off
+    python build_library.py --debug      # verbose + screenshots
+    python build_library.py --fresh      # wipe library and restart
+    python build_library.py --show       # print library stats and exit
+    python build_library.py --resetprofile   # delete saved Chrome profile (force re-login)
 """
 
-import asyncio, json, os, re, sys, argparse
+import asyncio, json, os, re, sys, argparse, time
 from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 
 LIBRARY_PATH  = Path("uworld_library.json")
 PROGRESS_PATH = Path("uworld_library_progress.json")
+PROFILE_DIR   = Path("uworld_pw_profile")   # persisted across runs (Playwright Chromium)
 APPS_BASE     = "https://apps.uworld.com/courseapp/usmle/v53/en-US"
 
 SEARCH_TERMS = [
-    "cardiovascular","renal","pulmonary","gastrointestinal",
-    "endocrine","neurology","hematology","infectious",
-    "obstetrics","gynecology","pediatrics","psychiatry",
-    "dermatology","musculoskeletal","oncology","surgery",
-    "emergency","biostatistics","pharmacology","immunology",
-    "fever","chest","abdominal","headache","fatigue",
-    "hypertension","diabetes","pregnancy","trauma","blood",
-    "fracture","weight","nausea","seizure","rash",
-    "vision","urinary","alcohol","screening","ethics",
-    "vaccine","antibiotic","pain","cough","weakness",
+    "cardiovascular", "renal", "pulmonary", "gastrointestinal",
+    "endocrine", "neurology", "hematology", "infectious",
+    "obstetrics", "gynecology", "pediatrics", "psychiatry",
+    "dermatology", "musculoskeletal", "oncology", "surgery",
+    "emergency", "biostatistics", "pharmacology", "immunology",
+    "fever", "chest", "abdominal", "headache", "fatigue",
+    "hypertension", "diabetes", "pregnancy", "trauma", "blood",
+    "fracture", "weight", "nausea", "seizure", "rash",
+    "vision", "urinary", "alcohol", "screening", "ethics",
+    "vaccine", "antibiotic", "pain", "cough", "weakness",
+    "heart", "lung", "kidney", "liver", "brain",
+    "cancer", "infection", "stroke", "failure", "syndrome",
+    "therapy", "diagnosis", "management", "prevention", "drug",
+    "test", "patient", "woman", "man", "child",
 ]
 
-# ── Stealth JS injected before every page load ───────────────────────────────
-# Hides the most common Playwright / headless Chrome fingerprints.
-STEALTH_SCRIPT = """
-// 1. Hide webdriver flag
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 
-// 2. Add a realistic Chrome object
-if (!window.chrome) {
-    window.chrome = {
-        app: {isInstalled: false},
-        runtime: {},
-        csi: () => {},
-        loadTimes: () => {},
-    };
-}
-
-// 3. Add fake plugins so navigator.plugins isn't empty
-Object.defineProperty(navigator, 'plugins', {
-    get: () => [
-        {name:'Chrome PDF Plugin', filename:'internal-pdf-viewer'},
-        {name:'Chrome PDF Viewer', filename:'mhjfbmdgcfjbbpaeojofohoefgiehjai'},
-        {name:'Native Client', filename:'internal-nacl-plugin'},
-    ]
-});
-
-// 5. Realistic languages
-Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
-"""
-
+# ── Utility functions ──────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--headless", action="store_true")
-    p.add_argument("--fresh",    action="store_true")
-    p.add_argument("--show",     action="store_true")
-    p.add_argument("--debug",    action="store_true")
+    p.add_argument("--headless",      action="store_true", help="Run headless (only works if already logged in)")
+    p.add_argument("--fresh",         action="store_true", help="Wipe library and restart")
+    p.add_argument("--show",          action="store_true", help="Print stats and exit")
+    p.add_argument("--debug",         action="store_true", help="Verbose output + screenshots")
+    p.add_argument("--resetprofile",  action="store_true", help="Delete saved Chrome profile")
     return p.parse_args()
 
 def load_library():
@@ -91,21 +76,21 @@ def save_progress(p):
     PROGRESS_PATH.write_text(json.dumps(p, indent=2), encoding="utf-8")
 
 def show_stats(lib):
-    if not lib: print("Library is empty."); return
+    if not lib:
+        print("Library is empty."); return
     subjects, systems = {}, {}
     for q in lib.values():
-        s = q.get("subject","?"); subjects[s] = subjects.get(s, 0)+1
-        s = q.get("system", "?"); systems [s] = systems .get(s, 0)+1
+        s = q.get("subject", "?"); subjects[s] = subjects.get(s, 0) + 1
+        s = q.get("system",  "?"); systems[s]  = systems.get(s, 0)  + 1
     print(f"\n{'='*50}\n  UWorld Library: {len(lib)} questions\n{'='*50}")
     print("\nBy Subject:")
-    for s,n in sorted(subjects.items(), key=lambda x:-x[1]): print(f"  {n:4d}  {s}")
+    for s, n in sorted(subjects.items(), key=lambda x: -x[1]):
+        print(f"  {n:4d}  {s}")
     print("\nBy System (top 20):")
-    for s,n in sorted(systems.items(),  key=lambda x:-x[1])[:20]: print(f"  {n:4d}  {s}")
-    missing = sum(1 for q in lib.values() if not q.get("topic"))
-    print(f"\n  Missing topic: {missing} questions")
+    for s, n in sorted(systems.items(), key=lambda x: -x[1])[:20]:
+        print(f"  {n:4d}  {s}")
+    print(f"\n  Missing topic: {sum(1 for q in lib.values() if not q.get('topic'))}")
 
-
-# ── Parse question records from any JSON shape ────────────────────────────────
 def parse_questions(data):
     results = []
     def _ex(obj):
@@ -113,9 +98,9 @@ def parse_questions(data):
         qid = (obj.get("id") or obj.get("qid") or obj.get("questionId")
                or obj.get("itemId") or obj.get("uwId"))
         if not qid: return
-        subject = (obj.get("subject") or obj.get("subjectName") or obj.get("discipline"))
-        system  = (obj.get("system")  or obj.get("systemName")  or obj.get("bodySystem"))
-        topic   = (obj.get("topic")   or obj.get("topicName")   or obj.get("concept"))
+        subject = obj.get("subject") or obj.get("subjectName") or obj.get("discipline")
+        system  = obj.get("system")  or obj.get("systemName")  or obj.get("bodySystem")
+        topic   = obj.get("topic")   or obj.get("topicName")   or obj.get("concept")
         pct     = (obj.get("percentCorrect") or obj.get("pctCorrect")
                    or obj.get("correctPercent") or obj.get("percentCorrectGlobal"))
         results.append({
@@ -127,246 +112,372 @@ def parse_questions(data):
         })
     def _walk(obj):
         if isinstance(obj, dict):
-            _ex(obj)
-            for v in obj.values(): _walk(v)
+            _ex(obj); [_walk(v) for v in obj.values()]
         elif isinstance(obj, list):
-            for v in obj: _walk(v)
+            [_walk(v) for v in obj]
     _walk(data)
     return results
 
+async def wait_for_content(page, timeout=60, debug=False):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        c = await page.evaluate("""() => ({
+            nav:    document.querySelectorAll('nav a,[class*=sidebar] a').length,
+            inputs: document.querySelectorAll('input:not([type=hidden])').length,
+            btns:   document.querySelectorAll('button').length,
+        })""")
+        if debug: print(f"     [wait] {c}")
+        if (c.get("inputs",0) + c.get("btns",0) + c.get("nav",0)) >= 3:
+            return True
+    return False
 
-# ── Main browser session ───────────────────────────────────────────────────────
+
+# ── Main run ───────────────────────────────────────────────────────────────────
+
 async def run(args):
     from playwright.async_api import async_playwright
+    from playwright_stealth import Stealth
 
     lib      = load_library()
     progress = load_progress()
-
     email    = os.getenv("UWORLD_EMAIL")    or input("UWorld email: ").strip()
-    password = os.getenv("UWORLD_PASSWORD") or __import__("getpass").getpass("UWorld password: ")
+    password = os.getenv("UWORLD_PASSWORD") or __import__("getpass").getpass()
+
+    sub_id_box     = {}
+    captured_items = []
+
+    PROFILE_DIR.mkdir(exist_ok=True)
+
+    # Remove stale lockfile from a previous crashed run
+    for lockname in ("lockfile", "SingletonLock", "SingletonSocket"):
+        lf = PROFILE_DIR / lockname
+        if lf.exists():
+            try: lf.unlink(); print(f"  [CLEAN]  Removed stale {lockname}")
+            except Exception: pass
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
+
+        # ── LAUNCH PERSISTENT CHROMIUM ─────────────────────────────────────
+        # Uses Playwright's bundled Chromium (not real Chrome) to avoid lockfile
+        # conflicts with the user's running Chrome browser.
+        # launch_persistent_context() saves session cookies/storage between runs.
+        # First run: user logs in manually (one-time). Future runs: cookies valid.
+        print(f"  [BROWSER] Launching Chromium with profile: {PROFILE_DIR.resolve()}")
+        ctx = await pw.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
             headless=args.headless,
-            args=["--disable-blink-features=AutomationControlled"]
-        )
-        # ONE context for everything — stealth applied, native Playwright
-        # fill() handles Angular forms fine regardless of stealth patches.
-        ctx = await browser.new_context(
-            viewport={"width": 1280, "height": 900},
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+            viewport={"width": 1440, "height": 900},
+            locale="en-US",
+            timezone_id="America/New_York",
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Chrome/136.0.0.0 Safari/537.36"
             ),
-            locale="en-US",
-            timezone_id="America/New_York",
         )
-        await ctx.add_init_script(STEALTH_SCRIPT)
 
-        sub_id_box = {}
-        async def capture_subs(resp):
-            if "GetAllSubscriptions" in resp.url or "GetPayments" in resp.url:
-                try: sub_id_box[resp.url] = await resp.json()
+        await Stealth(chrome_runtime=False).apply_stealth_async(ctx)
+
+        new_pages = []
+        ctx.on("page", lambda p: new_pages.append(p))
+
+        # Get or create the first tab
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        # Response interceptor (shared for both login and qbank tabs)
+        async def on_resp(resp):
+            url = resp.url
+            if "GetAllSubscriptions" in url or "GetPaymentsForSubscription" in url:
+                try: sub_id_box[url] = await resp.json()
+                except Exception: pass
+            if args.debug and "userapi/auth" in url.lower():
+                try:
+                    body = (await resp.body())[:150].decode(errors="replace")
+                    print(f"     [AUTH] {resp.status} {url[:70]}: {body[:100]}")
                 except Exception: pass
 
-        page = await ctx.new_page()
-        page.on("response", capture_subs)
+        page.on("response", on_resp)
 
-        # ── Login ─────────────────────────────────────────────────────────
-        print("  🔐 Logging in...")
-        await page.goto("https://www.uworld.com/app/index.html#/login/",
-                        wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(2)
-
-        try: await page.wait_for_selector("#login-email", timeout=12000)
-        except Exception: await page.wait_for_selector('input[type="email"]', timeout=5000)
-
-        # Accept cookie consent banner — UWorld may require this for auth to work
+        # ── CHECK IF ALREADY LOGGED IN ─────────────────────────────────────
+        print("  [LOGIN] Checking existing session...")
         try:
-            await page.locator("text=Allow All").click(timeout=3000)
-            await asyncio.sleep(0.5)
+            await page.goto("https://www.uworld.com/app/index.html#/subscriptions/",
+                            wait_until="networkidle", timeout=20000)
+            await asyncio.sleep(3)
         except Exception:
             pass
 
-        # Focus email field via JS (avoids navbar overlay click issue),
-        # then type real keystrokes — this is the most human-like approach
-        # and hardest for UWorld's bot detection to flag.
-        await page.evaluate("() => document.getElementById('login-email').focus()")
-        await asyncio.sleep(0.2)
-        await page.keyboard.type(email, delay=60)
-        await asyncio.sleep(0.3)
+        if "#/login" in page.url or "/login" in page.url.lower():
+            print("  [LOGIN] No saved session — logging in...")
 
-        # Tab to password field, then type password
-        await page.keyboard.press("Tab")
-        await asyncio.sleep(0.2)
-        await page.keyboard.type(password, delay=60)
-        await asyncio.sleep(0.4)
+            # Dismiss cookie banner
+            await page.evaluate("""() => {
+                const b = [...document.querySelectorAll('button')]
+                    .find(b => b.textContent.includes('Allow All'));
+                if (b) b.click();
+            }""")
+            await asyncio.sleep(1)
 
+            # Try automated login
+            auto_login_ok = False
+            try:
+                await page.wait_for_selector("#login-email", timeout=8000)
+
+                # Click label to focus input (label overlays the input element)
+                await page.locator("label[for='login-email']").click(timeout=4000)
+                await asyncio.sleep(0.3)
+                await page.keyboard.type(email, delay=35)
+                await asyncio.sleep(0.4)
+                await page.locator("label[for='login-password']").click(timeout=4000)
+                await asyncio.sleep(0.3)
+                await page.keyboard.type(password, delay=35)
+                await asyncio.sleep(1.0)
+
+                # Submit
+                btn = page.locator("button[type=submit]")
+                if await btn.count() == 0:
+                    btn = page.locator("button").filter(
+                        has_text=re.compile("login", re.I)).first
+                await btn.click(timeout=5000)
+                print("  [LOGIN] Submitted credentials — waiting for redirect...")
+
+                try:
+                    await page.wait_for_function(
+                        "!window.location.hash.includes('login')", timeout=20000)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+
+                if "#/login" not in page.url:
+                    auto_login_ok = True
+                    print("  [LOGIN] Automated login succeeded!")
+
+            except Exception as e:
+                print(f"  [LOGIN] Automated login error: {e}")
+
+            if not auto_login_ok:
+                # ── MANUAL LOGIN FALLBACK ──────────────────────────────────
+                # reCAPTCHA blocked automated login. Open the login page and wait
+                # for the user to log in manually. They only need to do this ONCE —
+                # the session is saved in the profile for all future runs.
+                print("\n" + "="*55)
+                print("  MANUAL LOGIN REQUIRED (one-time setup)")
+                print("="*55)
+                print("  The UWorld login page is open in Chrome.")
+                print("  Please log in with your credentials manually.")
+                print("  The script will continue automatically once")
+                print("  you're logged in.")
+                print("  Waiting up to 3 hours...")
+                print("="*55 + "\n")
+
+                # Make sure we're on the login page
+                try:
+                    await page.goto("https://www.uworld.com/app/index.html#/login/",
+                                    wait_until="networkidle", timeout=15000)
+                except Exception:
+                    pass
+
+                # Wait up to 3 hours for manual login (user may be asleep)
+                for secs in range(10800):
+                    await asyncio.sleep(1)
+                    try:
+                        curr_url = page.url
+                        if "#/login" not in curr_url and "login" not in curr_url.lower():
+                            print(f"\n  [LOGIN] Manual login detected! URL: {curr_url[:80]}")
+                            break
+                        if secs % 30 == 0 and secs > 0:
+                            print(f"  [WAIT]  Still waiting for login... ({secs}s elapsed)")
+                    except Exception:
+                        break
+                else:
+                    print("  [FAIL] Timed out waiting for manual login.")
+                    await ctx.close()
+                    return
+
+        if "#/login" in page.url:
+            print("  [FAIL] Login failed — session still on login page.")
+            await ctx.close()
+            return
+
+        print(f"  [OK]   Session active! URL: {page.url[:80]}")
         if args.debug:
-            await page.screenshot(path="debug_01b_pre_submit.png")
-            print("     Saved debug_01b_pre_submit.png")
+            await page.screenshot(path="debug_03_loggedin.png")
 
-        # Submit with Enter (most natural form submission)
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
+        # Let subscriptions page finish loading
+        await asyncio.sleep(5)
 
-        try: await page.wait_for_function(
-            "!window.location.hash.includes('login')", timeout=25000)
-        except Exception: pass
-        await asyncio.sleep(3)
-
-        current_hash = await page.evaluate("window.location.hash")
-        if "login" in current_hash.lower():
-            await page.screenshot(path="debug_login_failed.png")  # always save
-            # Check for error message on the page
-            err_text = await page.evaluate(
-                "() => document.querySelector('[class*=error],[class*=alert],"
-                "[class*=message]')?.textContent?.trim() || '(no error text found)'"
-            )
-            raise RuntimeError(
-                f"Login failed. Page error: {err_text}\n"
-                "Check debug_login_failed.png to see the login page state.\n"
-                "If you see 'Unable to authenticate', try logging into uworld.com\n"
-                "manually first — the account may be temporarily rate-limited."
-            )
-        print(f"  ✅ Logged in!")
-        if args.debug: await page.screenshot(path="debug_01_loggedin.png")
-
-        # ── Find subscription ID ──────────────────────────────────────────
-        await asyncio.sleep(2)
+        # ── SUBSCRIPTION ID ────────────────────────────────────────────────
         sub_id = progress.get("sub_id")
         if not sub_id:
-            all_subs = next((v for k,v in sub_id_box.items() if "GetAllSubscriptions" in k), None)
+            all_subs = next(
+                (v for k, v in sub_id_box.items() if "GetAllSubscriptions" in k), None)
             if all_subs and isinstance(all_subs, list):
                 for item in all_subs:
                     if not isinstance(item, dict): continue
                     if item.get("IsSim") or item.get("FormId"): continue
                     name = str(item.get("CourseName") or "").lower()
-                    if any(x in name for x in ["self-assessment","free trial"]): continue
+                    if any(x in name for x in ["self-assessment","free trial","sat ","act "]): continue
                     sid = item.get("SubscriptionId")
-                    if sid: sub_id = str(sid); break
+                    if sid:
+                        sub_id = str(sid)
+                        print(f"  [SUB]  Found: {item.get('CourseName')} -> {sub_id}")
+                        break
             if not sub_id:
-                ids = sorted({re.search(r'GetPaymentsForSubscription/(\d+)', u).group(1)
-                              for u in sub_id_box
-                              if re.search(r'GetPaymentsForSubscription/(\d+)', u)}, key=int)
-                sub_id = ids[1] if len(ids) > 1 else (ids[0] if ids else None)
-            if not sub_id: raise RuntimeError("Could not find subscription ID.")
+                ids = sorted(
+                    {re.search(r'GetPaymentsForSubscription/(\d+)', u).group(1)
+                     for u in sub_id_box
+                     if re.search(r'GetPaymentsForSubscription/(\d+)', u)}, key=int)
+                sub_id = ids[1] if len(ids) > 1 else (ids[0] if ids else "15778134")
+            if not sub_id:
+                sub_id = "15778134"
             progress["sub_id"] = sub_id
             save_progress(progress)
-        print(f"  📋 Subscription ID: {sub_id}")
 
-        # ── Navigate into the qbank via Launch button ─────────────────────
-        # CRITICAL: must click Launch from the account page so the browser
-        # follows the auth redirect that sets apps.uworld.com session cookies.
-        # Direct navigation gets a blank page because those cookies are missing.
-        print("  🚀 Launching qbank...")
-        qb_page = None
+        print(f"  [SUB]  Subscription ID: {sub_id}")
 
-        # Strategy 1: click Launch, capture the new tab it opens
+        # ── INSPECT & CLICK LAUNCH ─────────────────────────────────────────
+        launch_info = await page.evaluate("""() =>
+            [...document.querySelectorAll('a,button')]
+            .filter(e => /^launch$/i.test(e.textContent.trim()))
+            .map(e => ({
+                tag: e.tagName, href: e.href||'', target: e.getAttribute('target')||'',
+                parentTxt: (e.parentElement?.textContent?.trim()?.substring(0,50)||'')
+            }))
+        """)
+        print(f"  [LAUNCH] Launch buttons found: {json.dumps(launch_info)}")
+
+        print("  [LAUNCH] Clicking QBank Launch button...")
         try:
-            async with ctx.expect_page(timeout=10000) as pg_info:
-                # Use JS click (bypasses any overlay on the Launch button)
-                await page.evaluate(
-                    "() => { const all=[...document.querySelectorAll('a,button')];"
-                    " const med=all.find(e=>{ if(!/launch/i.test(e.textContent))return false;"
-                    " const row=e.closest('tr,li,div');return !row||/step|ck|qbank|medical/i.test(row.textContent);});"
-                    " const btn=med||all.find(e=>/launch/i.test(e.textContent));"
-                    " if(btn)btn.click(); }"
-                )
-            qb_page = await pg_info.value
-            await qb_page.wait_for_load_state("networkidle", timeout=25000)
-            await asyncio.sleep(3)
-            if args.debug:
-                await qb_page.screenshot(path="debug_02_qbank.png")
-                print(f"     qbank: {qb_page.url}")
+            launch_btn = page.locator("a, button").filter(
+                has_text=re.compile(r"^launch$", re.I)
+            ).first
+            await launch_btn.click(timeout=6000)
+            print("  [LAUNCH] Clicked via Playwright.")
         except Exception as e:
-            if args.debug: print(f"     Launch new-tab: {e}")
+            print(f"  [WARN]  Playwright click failed ({e}), JS fallback")
+            await page.evaluate("""() => {
+                const all = [...document.querySelectorAll('a,button')];
+                const btn = all.find(e => /^launch$/i.test(e.textContent.trim()));
+                if (btn) btn.click();
+            }""")
 
-        # Strategy 2: navigate the current page to the launch href
+        # Wait for new tab
+        qb_page = None
+        print("  [LAUNCH] Waiting for apps.uworld.com tab...")
+        for _ in range(25):
+            await asyncio.sleep(1)
+            if new_pages:
+                qb_page = new_pages[-1]
+                print(f"  [LAUNCH] New tab: {qb_page.url[:80]}")
+                break
+
+        if not qb_page and "apps.uworld.com" in page.url:
+            qb_page = page
+            print(f"  [LAUNCH] Same-tab: {page.url[:80]}")
+
         if not qb_page or "apps.uworld.com" not in qb_page.url:
-            launch_href = await page.evaluate(
-                "() => { const b=[...document.querySelectorAll('a,button')]"
-                ".find(e=>/launch/i.test(e.textContent));"
-                " return b&&b.href?b.href:null; }"
-            )
-            if launch_href and "uworld.com" in launch_href:
-                await page.goto(launch_href, wait_until="networkidle", timeout=25000)
-                await asyncio.sleep(3)
+            # Try following Launch href directly
+            launch_href = next(
+                (i["href"] for i in launch_info if "uworld.com" in i.get("href","")), None)
+            if launch_href:
+                print(f"  [LAUNCH] Following href: {launch_href[:80]}")
+                await page.goto(launch_href, wait_until="networkidle", timeout=30000)
+                await asyncio.sleep(5)
                 if "apps.uworld.com" in page.url:
                     qb_page = page
-                    if args.debug: print(f"     qbank (same tab): {qb_page.url}")
 
-        # Strategy 3: direct navigation — may get a blank page if auth didn't transfer
         if not qb_page or "apps.uworld.com" not in qb_page.url:
-            print("  ⚠️  Could not launch via button — trying direct navigation")
+            print("  [WARN]  Launch strategies failed — direct nav as last resort")
             qb_page = await ctx.new_page()
             await qb_page.goto(f"{APPS_BASE}/dashboard/{sub_id}",
-                               wait_until="networkidle", timeout=25000)
+                               wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(10)
+
+        if args.debug:
+            await qb_page.screenshot(path="debug_04_qbank.png")
+            print(f"  [LAUNCH] qb_page URL: {qb_page.url[:80]}")
+
+        # ── WAIT FOR ANGULAR APP ───────────────────────────────────────────
+        print("  [WAIT]  Waiting for Angular app to initialize...")
+        qb_page.on("response", on_resp)
+        loaded = await wait_for_content(qb_page, timeout=60, debug=args.debug)
+        print(f"  [WAIT]  Content loaded: {loaded}  URL: {qb_page.url[:80]}")
+
+        if args.debug:
+            await qb_page.screenshot(path="debug_04b_after_wait.png")
+
+        # ── NAVIGATE TO SEARCH ─────────────────────────────────────────────
+        search_path = f"/courseapp/usmle/v53/en-US/search/{sub_id}/false"
+        search_url  = f"https://apps.uworld.com{search_path}"
+        print(f"  [SEARCH] Navigating to search page...")
+
+        if loaded:
+            await qb_page.evaluate(f"""() => {{
+                const p = {json.dumps(search_path)};
+                window.history.pushState(null, '', p);
+                window.dispatchEvent(new PopStateEvent('popstate', {{state:null}}));
+            }}""")
             await asyncio.sleep(5)
-            if args.debug:
-                await qb_page.screenshot(path="debug_02_qbank_direct.png")
-                print(f"     direct nav: {qb_page.url}")
 
-        if args.debug: print(f"  In qbank: {qb_page.url if qb_page else 'none'}")
+        visible_inputs = await qb_page.evaluate(
+            "() => [...document.querySelectorAll('input')].filter(el=>el.offsetParent!==null).length"
+        )
+        print(f"  [SEARCH] Visible inputs after Angular nav: {visible_inputs}")
 
-        # ── Open search page ──────────────────────────────────────────────
-        search_url = f"{APPS_BASE}/search/{sub_id}/false"
-        print(f"  🔍 Opening search page...")
-        await qb_page.goto(search_url, wait_until="networkidle", timeout=30000)
-        await asyncio.sleep(6)  # Angular needs time to fully initialize
+        if visible_inputs == 0:
+            print("  [SEARCH] Trying page.goto for search URL...")
+            await qb_page.goto(search_url, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(10)
+            loaded2 = await wait_for_content(qb_page, timeout=30)
+            visible_inputs = await qb_page.evaluate(
+                "() => [...document.querySelectorAll('input')].filter(el=>el.offsetParent!==null).length"
+            )
+            print(f"  [SEARCH] After page.goto: inputs={visible_inputs}, loaded={loaded2}")
 
         if args.debug:
-            await qb_page.screenshot(path="debug_03_search_page.png")
-            print(f"     URL: {qb_page.url}")
+            await qb_page.screenshot(path="debug_05_search_page.png")
+            all_inp = await qb_page.evaluate(
+                "() => [...document.querySelectorAll('input')].map(el=>({"
+                "type:el.type,id:el.id,placeholder:el.placeholder,visible:el.offsetParent!==null}))"
+            )
+            print(f"  [SEARCH] All inputs: {json.dumps(all_inp)}")
 
-        # Report all inputs found — critical for debugging
-        all_inputs = await qb_page.evaluate(
-            "() => [...document.querySelectorAll('input')].map(el=>({"
-            "type:el.type,placeholder:el.placeholder,id:el.id,"
-            "name:el.name,visible:el.offsetParent!==null,"
-            "cls:el.className.substring(0,50)}))"
-        )
-        if args.debug:
-            print(f"     Inputs found: {len(all_inputs)}")
-            for inp in all_inputs: print(f"       {inp}")
-        elif len(all_inputs) == 0:
-            print("  ⚠️  No inputs found on search page — page may not be authenticated.")
-            print("     Run with --debug and check debug_03_search_page.png")
-
-        # Dismiss any modal/overlay (one-liner JS, no string concatenation issues)
-        await qb_page.evaluate(
-            "() => { document.querySelectorAll('[class*=modal] button,[class*=dialog] button,"
-            "[class*=alert] button').forEach(b=>b.click());"
-            " document.querySelectorAll('[class*=overlay],[class*=backdrop]')"
-            ".forEach(el=>{if(el.style)el.style.pointerEvents='none';}); }"
-        )
-        await asyncio.sleep(1)
-
-        # ── Set up response interceptor on the search page ────────────────
-        # We capture ALL JSON responses — the Angular app will fire real
-        # gateway-api calls when we type in the search box.
-        captured_items = []
-        async def on_search_response(resp):
-            ct = resp.headers.get("content-type","")
-            if "json" not in ct: return
-            # Only care about responses that look like question data
+        # ── RESPONSE INTERCEPTOR ───────────────────────────────────────────
+        async def on_search_resp(resp):
+            ct  = resp.headers.get("content-type", "")
             url = resp.url
-            if not any(x in url for x in ["gateway-api","search","question","item","qbank"]):
+            if "json" not in ct: return
+            if not any(x in url for x in
+                       ["gateway-api","search","question","item","qbank",
+                        "GetQuestions","GetItems","GetSearch","Search"]):
                 return
             try:
-                body = await resp.json()
+                body  = await resp.json()
                 items = parse_questions(body)
                 if items:
                     captured_items.extend(items)
                     if args.debug:
-                        print(f"       📡 {len(items)} questions from {url[:70]}")
+                        print(f"       [API] {len(items)} Qs <- {url[:80]}")
             except Exception:
                 pass
 
-        qb_page.on("response", on_search_response)
+        qb_page.on("response", on_search_resp)
 
-        # ── Search loop ───────────────────────────────────────────────────
+        # Dismiss modals
+        await qb_page.evaluate("""() => {
+            document.querySelectorAll('[class*=modal] button,[class*=dialog] button,[class*=alert] button')
+                    .forEach(b => b.click());
+            document.querySelectorAll('[class*=overlay],[class*=backdrop]')
+                    .forEach(el => { if(el.style) el.style.pointerEvents='none'; });
+        }""")
+        await asyncio.sleep(0.5)
+
+        # ── SEARCH LOOP ────────────────────────────────────────────────────
         terms_to_run = [t for t in SEARCH_TERMS if t not in progress["completed_terms"]]
         print(f"\n  Running {len(terms_to_run)} search terms...\n")
 
@@ -374,41 +485,31 @@ async def run(args):
             print(f"  [{i+1}/{len(terms_to_run)}] '{term}'", end=" ", flush=True)
             captured_items.clear()
 
-            # Fill the search input using JS (works even if Playwright can't "see" it)
             filled = await qb_page.evaluate(f"""() => {{
-                // Try multiple strategies to find the search input
                 const candidates = [
                     ...document.querySelectorAll('input[type=text]'),
                     ...document.querySelectorAll('input[type=search]'),
                     ...document.querySelectorAll('input:not([type=hidden])'),
                 ];
-                const inp = candidates.find(el => el.offsetParent !== null)
-                         || candidates[0];  // fallback: first input even if hidden
-
+                const inp = candidates.find(el => el.offsetParent !== null) || candidates[0];
                 if (!inp) return false;
-
-                // Focus and fill
                 inp.focus();
                 inp.value = {json.dumps(term)};
-                // Fire events Angular listens to
-                inp.dispatchEvent(new Event('focus',   {{bubbles:true}}));
-                inp.dispatchEvent(new Event('input',   {{bubbles:true}}));
-                inp.dispatchEvent(new Event('change',  {{bubbles:true}}));
-                inp.dispatchEvent(new KeyboardEvent('keydown',{{key:'Enter',keyCode:13,bubbles:true}}));
-                inp.dispatchEvent(new KeyboardEvent('keypress',{{key:'Enter',keyCode:13,bubbles:true}}));
-                inp.dispatchEvent(new KeyboardEvent('keyup',  {{key:'Enter',keyCode:13,bubbles:true}}));
+                ['focus','input','change'].forEach(ev =>
+                    inp.dispatchEvent(new Event(ev, {{bubbles:true}})));
+                ['keydown','keypress','keyup'].forEach(ev =>
+                    inp.dispatchEvent(new KeyboardEvent(ev,
+                        {{key:'Enter',keyCode:13,bubbles:true}})));
                 return inp.placeholder || inp.id || inp.name || '(found)';
             }}""")
 
-            # Also press Enter via Playwright keyboard (more reliable for form submit)
             await qb_page.keyboard.press("Enter")
-            await asyncio.sleep(6)  # wait for API response
+            await asyncio.sleep(6)
 
             if args.debug:
-                await qb_page.screenshot(path=f"debug_search_{term[:8]}.png")
-                print(f"\n       input filled: {filled}")
+                await qb_page.screenshot(path=f"debug_search_{term[:10]}.png")
+                print(f"\n       filled: {filled}")
 
-            # Merge captured results into library
             new_this = 0
             for q in captured_items:
                 qid = q["id"]
@@ -416,24 +517,23 @@ async def run(args):
                     lib[qid] = q; new_this += 1
                 else:
                     for f in ["subject","system","topic","pct_correct"]:
-                        if not lib[qid].get(f) and q.get(f):
-                            lib[qid][f] = q[f]
+                        if not lib[qid].get(f) and q.get(f): lib[qid][f] = q[f]
 
-            print(f"→ {len(captured_items)} results, {new_this} new  (total: {len(lib)})")
+            print(f"-> {len(captured_items)} results, {new_this} new  (total: {len(lib)})")
 
-            # Save after every term
             save_library(lib)
             progress["completed_terms"].append(term)
             save_progress(progress)
 
-            # Clear search box for next term
+            # Clear input for next term
             await qb_page.evaluate("""() => {
-                const inp = document.querySelector('input[type=text],input[type=search],input:not([type=hidden])');
-                if(inp){inp.value='';inp.dispatchEvent(new Event('input',{bubbles:true}));}
+                const inp = document.querySelector(
+                    'input[type=text],input[type=search],input:not([type=hidden])');
+                if (inp){ inp.value=''; inp.dispatchEvent(new Event('input',{bubbles:true})); }
             }""")
             await asyncio.sleep(0.5)
 
-        await browser.close()
+        await ctx.close()
 
     print(f"\n{'='*50}")
     print(f"  Done! {len(lib)} questions in library.")
@@ -443,18 +543,31 @@ async def run(args):
 
 async def main():
     args = parse_args()
+
     if args.show:
         show_stats(load_library()); return
+
+    if args.resetprofile:
+        import shutil
+        if PROFILE_DIR.exists():
+            shutil.rmtree(PROFILE_DIR)
+            print(f"  Deleted Chrome profile: {PROFILE_DIR}")
+        LIBRARY_PATH.unlink(missing_ok=True)
+        PROGRESS_PATH.unlink(missing_ok=True)
+        print("  Reset complete. You'll need to log in manually on next run.")
+        return
+
     if args.fresh:
         LIBRARY_PATH.unlink(missing_ok=True)
         PROGRESS_PATH.unlink(missing_ok=True)
-        print("  🗑️  Wiped existing library.")
+        print("  [WIPE]  Library wiped (Chrome profile kept — no re-login needed).")
 
-    lib = load_library()
+    lib  = load_library()
     prog = load_progress()
     print(f"\n{'='*50}\n  UWorld Library Builder\n{'='*50}")
-    print(f"  Library: {len(lib)} questions")
-    print(f"  Completed: {len(prog['completed_terms'])}/{len(SEARCH_TERMS)} terms")
+    print(f"  Library : {len(lib)} questions")
+    print(f"  Progress: {len(prog['completed_terms'])}/{len(SEARCH_TERMS)} terms done")
+    print(f"  Profile : {PROFILE_DIR.resolve()}")
 
     await run(args)
 
