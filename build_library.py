@@ -34,6 +34,7 @@ PROFILE_DIR   = Path("uworld_pw_profile")   # persisted across runs (Playwright 
 APPS_BASE     = "https://apps.uworld.com/courseapp/usmle/v53/en-US"
 
 SEARCH_TERMS = [
+    # Broad medical categories (round 1)
     "cardiovascular", "renal", "pulmonary", "gastrointestinal",
     "endocrine", "neurology", "hematology", "infectious",
     "obstetrics", "gynecology", "pediatrics", "psychiatry",
@@ -48,6 +49,30 @@ SEARCH_TERMS = [
     "cancer", "infection", "stroke", "failure", "syndrome",
     "therapy", "diagnosis", "management", "prevention", "drug",
     "test", "patient", "woman", "man", "child",
+    # Specific conditions (round 2 — for higher coverage)
+    "pneumonia", "anemia", "sepsis", "appendicitis", "cholecystitis",
+    "pancreatitis", "hepatitis", "cirrhosis", "thyroid", "arrhythmia",
+    "atrial fibrillation", "myocardial infarction", "pulmonary embolism",
+    "deep vein thrombosis", "meningitis", "encephalitis", "cellulitis",
+    "osteomyelitis", "pyelonephritis", "glomerulonephritis",
+    "asthma", "COPD", "pleural effusion", "pneumothorax",
+    "hyperthyroid", "hypothyroid", "adrenal", "Cushing",
+    "Addison", "hyperkalemia", "hyponatremia", "metabolic acidosis",
+    "respiratory alkalosis", "transfusion", "sickle cell",
+    "leukemia", "lymphoma", "melanoma", "colon cancer",
+    "breast cancer", "prostate", "ovarian", "cervical",
+    "ectopic", "preeclampsia", "placenta", "abortion",
+    "neonatal", "congenital", "developmental", "autism",
+    "depression", "anxiety", "schizophrenia", "bipolar",
+    "dementia", "Parkinson", "multiple sclerosis", "seizure disorder",
+    "peripheral neuropathy", "spinal cord", "radiculopathy",
+    "osteoporosis", "gout", "rheumatoid", "lupus", "scleroderma",
+    "Crohn", "ulcerative colitis", "irritable bowel",
+    "peptic ulcer", "GERD", "bowel obstruction", "hernia",
+    "acute kidney injury", "chronic kidney disease", "dialysis",
+    "proteinuria", "hematuria", "kidney stone",
+    "sexually transmitted", "HIV", "tuberculosis", "malaria",
+    "food poisoning", "wound", "abscess",
 ]
 
 
